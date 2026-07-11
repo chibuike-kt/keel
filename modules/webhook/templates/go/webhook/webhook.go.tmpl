@@ -23,10 +23,11 @@ type Verifier interface {
 }
 
 var (
-	ErrMissingHeader    = errors.New("webhook: signature header missing")
-	ErrInvalidSignature = errors.New("webhook: signature mismatch")
-	ErrStaleTimestamp   = errors.New("webhook: timestamp outside tolerance")
-	ErrMalformedHeader  = errors.New("webhook: signature header malformed")
+	ErrMissingHeader        = errors.New("webhook: signature header missing")
+	ErrInvalidSignature     = errors.New("webhook: signature mismatch")
+	ErrStaleTimestamp       = errors.New("webhook: timestamp outside tolerance")
+	ErrMalformedHeader      = errors.New("webhook: signature header malformed")
+	ErrUnsupportedAlgorithm = errors.New("webhook: signature algorithm not supported")
 )
 
 // Middleware wraps a handler so it only runs once v verifies the request.
