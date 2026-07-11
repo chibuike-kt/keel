@@ -1,0 +1,50 @@
+package webhook
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"net/http"
+)
+
+type flutterwaveVerifier struct {
+	secretHash string
+}
+
+// ProviderFlutterwave returns a Verifier for Flutterwave's
+// flutterwave-signature scheme, confirmed current at
+// developer.flutterwave.com/docs/webhooks: HMAC-SHA256(secretHash,
+// rawBody), base64-encoded.
+//
+// This is deliberately NOT the older "verif-hash" scheme that appears in
+// many tutorials and the deprecated v2/Rave API, where the header is
+// compared to the configured secret hash with plain string equality and no
+// hashing at all. That scheme sends the shared secret itself on every
+// request: anyone who has ever seen one webhook delivery — a proxy log, a
+// debugging screenshot, a misconfigured logger — has a permanently valid
+// "signature" for every future request, because it never changes and never
+// depends on the payload. Do not "fix" this back to plain equality
+// thinking it's simpler or more correct; it is the deprecated, weaker
+// scheme this implementation intentionally avoids.
+func ProviderFlutterwave(secretHash string) Verifier {
+	return &flutterwaveVerifier{secretHash: secretHash}
+}
+
+func (v *flutterwaveVerifier) Verify(rawBody []byte, headers http.Header) error {
+	signature := headers.Get("flutterwave-signature")
+	if signature == "" {
+		return ErrMissingHeader
+	}
+
+	mac := hmac.New(sha256.New, []byte(v.secretHash))
+	mac.Write(rawBody)
+	expected := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+
+	// Compared as encoded strings, the same pattern used for Stripe's hex
+	// signatures and Paystack's hex signatures above — one consistent
+	// comparison style across every provider in this package.
+	if !constantTimeEqual([]byte(expected), []byte(signature)) {
+		return ErrInvalidSignature
+	}
+	return nil
+}

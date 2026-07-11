@@ -1,0 +1,39 @@
+package webhook
+
+import (
+	"crypto/hmac"
+	"crypto/sha512"
+	"encoding/hex"
+	"net/http"
+)
+
+type paystackVerifier struct {
+	secret string
+}
+
+// ProviderPaystack returns a Verifier for Paystack's x-paystack-signature
+// scheme: HMAC-SHA512(secret, rawBody), hex-encoded.
+//
+// Paystack's scheme has no timestamp field, so timestamp-based replay
+// protection is structurally impossible to add here — there is nothing in
+// the documented signing scheme for a verifier to check. This is a
+// limitation of the scheme itself, not a gap in this implementation.
+func ProviderPaystack(secret string) Verifier {
+	return &paystackVerifier{secret: secret}
+}
+
+func (v *paystackVerifier) Verify(rawBody []byte, headers http.Header) error {
+	signature := headers.Get("x-paystack-signature")
+	if signature == "" {
+		return ErrMissingHeader
+	}
+
+	mac := hmac.New(sha512.New, []byte(v.secret))
+	mac.Write(rawBody)
+	expected := hex.EncodeToString(mac.Sum(nil))
+
+	if !constantTimeEqual([]byte(expected), []byte(signature)) {
+		return ErrInvalidSignature
+	}
+	return nil
+}

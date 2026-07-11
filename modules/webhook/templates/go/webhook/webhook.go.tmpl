@@ -1,0 +1,71 @@
+// Package webhook verifies inbound webhook requests against a
+// provider-specific signature scheme before a handler ever sees them.
+package webhook
+
+import (
+	"bytes"
+	"crypto/hmac"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+)
+
+// Verifier checks whether an incoming webhook request is authentic.
+// Implementations must operate on the exact raw bytes received — never a
+// re-marshaled or parsed-then-reserialized payload. Re-serialization is not
+// guaranteed to reproduce the sender's original bytes (field order,
+// spacing, and numeric formatting can all differ), and a signature checked
+// against different bytes than the sender signed will silently fail to
+// verify what it claims to.
+type Verifier interface {
+	Verify(rawBody []byte, headers http.Header) error
+}
+
+var (
+	ErrMissingHeader    = errors.New("webhook: signature header missing")
+	ErrInvalidSignature = errors.New("webhook: signature mismatch")
+	ErrStaleTimestamp   = errors.New("webhook: timestamp outside tolerance")
+	ErrMalformedHeader  = errors.New("webhook: signature header malformed")
+)
+
+// Middleware wraps a handler so it only runs once v verifies the request.
+// It reads and buffers the raw body, then restores it via a fresh
+// io.NopCloser so the real handler can still read it — same pattern as
+// idempotency's middleware. Any verification failure is rejected with 400;
+// on success, next runs unchanged.
+func Middleware(v Verifier) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				writeJSONError(w, http.StatusBadRequest, "failed to read request body")
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+
+			if err := v.Verify(body, r.Header); err != nil {
+				writeJSONError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// constantTimeEqual reports whether a and b are equal, in time independent
+// of how many leading bytes match. Every provider in this package uses
+// this (via hmac.Equal) instead of == or bytes.Equal for a signature
+// comparison — a naive comparison short-circuits on the first mismatched
+// byte, leaking timing information an attacker can use to brute-force a
+// valid signature one byte at a time.
+func constantTimeEqual(a, b []byte) bool {
+	return hmac.Equal(a, b)
+}
+
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
+}

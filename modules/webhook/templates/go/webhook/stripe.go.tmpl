@@ -1,0 +1,98 @@
+package webhook
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// StripeOption configures a Verifier returned by ProviderStripe.
+type StripeOption func(*stripeVerifier)
+
+// WithTolerance sets how far a webhook's timestamp may drift from now
+// before it's rejected as stale. Default: 5 minutes, matching Stripe's own
+// documented tolerance.
+func WithTolerance(d time.Duration) StripeOption {
+	return func(v *stripeVerifier) {
+		v.tolerance = d
+	}
+}
+
+type stripeVerifier struct {
+	secret    string
+	tolerance time.Duration
+	now       func() time.Time // overridden in tests to control elapsed time
+}
+
+// ProviderStripe returns a Verifier for Stripe's Stripe-Signature scheme
+// (https://docs.stripe.com/webhooks#verify-manually): a comma-separated
+// header of "t=<timestamp>,v1=<signature>[,v1=<signature>...]", where each
+// signature is HMAC-SHA256(secret, "{t}.{rawBody}"), hex-encoded.
+func ProviderStripe(secret string, opts ...StripeOption) Verifier {
+	v := &stripeVerifier{
+		secret:    secret,
+		tolerance: 5 * time.Minute,
+		now:       time.Now,
+	}
+	for _, opt := range opts {
+		opt(v)
+	}
+	return v
+}
+
+func (v *stripeVerifier) Verify(rawBody []byte, headers http.Header) error {
+	header := headers.Get("Stripe-Signature")
+	if header == "" {
+		return ErrMissingHeader
+	}
+
+	var timestamp string
+	var signatures []string
+	for _, part := range strings.Split(header, ",") {
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		switch kv[0] {
+		case "t":
+			timestamp = kv[1]
+		case "v1":
+			// During secret rotation Stripe sends more than one v1 value —
+			// one per active signing secret — so any one of them matching
+			// is a valid signature, not just the last one seen.
+			signatures = append(signatures, kv[1])
+		}
+	}
+	if timestamp == "" || len(signatures) == 0 {
+		return ErrMalformedHeader
+	}
+
+	t, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil {
+		return ErrMalformedHeader
+	}
+
+	age := v.now().Unix() - t
+	if age < 0 {
+		age = -age
+	}
+	if time.Duration(age)*time.Second > v.tolerance {
+		return ErrStaleTimestamp
+	}
+
+	signedPayload := timestamp + "." + string(rawBody)
+	mac := hmac.New(sha256.New, []byte(v.secret))
+	mac.Write([]byte(signedPayload))
+	expected := hex.EncodeToString(mac.Sum(nil))
+
+	for _, sig := range signatures {
+		if constantTimeEqual([]byte(expected), []byte(sig)) {
+			return nil
+		}
+	}
+	return ErrInvalidSignature
+}

@@ -1,0 +1,32 @@
+apiVersion: keel/v1
+name: webhook
+version: 0.1.0
+summary: HMAC webhook signature verification with Stripe, Paystack, Flutterwave, and Nomba presets.
+tags: [payments, security]
+
+requires: []
+conflicts: []
+
+languages:
+  go:
+    templates:
+      - from: templates/go/webhook/webhook.go.tmpl
+        to: internal/webhook/webhook.go
+      - from: templates/go/webhook/stripe.go.tmpl
+        to: internal/webhook/stripe.go
+      - from: templates/go/webhook/paystack.go.tmpl
+        to: internal/webhook/paystack.go
+      - from: templates/go/webhook/flutterwave.go.tmpl
+        to: internal/webhook/flutterwave.go
+      - from: templates/go/webhook/nomba.go.tmpl
+        to: internal/webhook/nomba.go
+      - from: templates/go/webhook/webhook_test.go.tmpl
+        to: internal/webhook/webhook_test.go
+      - from: templates/go/webhook/stripe_test.go.tmpl
+        to: internal/webhook/stripe_test.go
+      - from: templates/go/webhook/paystack_test.go.tmpl
+        to: internal/webhook/paystack_test.go
+      - from: templates/go/webhook/flutterwave_test.go.tmpl
+        to: internal/webhook/flutterwave_test.go
+      - from: templates/go/webhook/nomba_test.go.tmpl
+        to: internal/webhook/nomba_test.go
