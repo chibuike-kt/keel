@@ -1,3 +1,3 @@
-module github.com/chibuike-kt/keel
+module github.com/chibuike-kt/Keel
 
 go 1.22
