@@ -3,6 +3,8 @@ package idempotency
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,8 +15,9 @@ import (
 )
 
 type fakeStore struct {
-	mu      sync.Mutex
-	records map[string]Record
+	mu         sync.Mutex
+	records    map[string]Record
+	reserveErr error
 }
 
 func newFakeStore() *fakeStore {
@@ -25,6 +28,10 @@ func (s *fakeStore) Reserve(_ context.Context, key, requestHash string, _ time.D
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.reserveErr != nil {
+		return Record{}, false, s.reserveErr
+	}
+
 	if existing, ok := s.records[key]; ok {
 		return existing, false, nil
 	}
@@ -32,6 +39,37 @@ func (s *fakeStore) Reserve(_ context.Context, key, requestHash string, _ time.D
 	record := Record{Key: key, RequestHash: requestHash, Status: StatusInProgress, CreatedAt: time.Now()}
 	s.records[key] = record
 	return record, true, nil
+}
+
+// errReader is an io.Reader that always fails, for exercising the
+// body-read-failure path.
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) {
+	return 0, errors.New("simulated read failure")
+}
+
+// assertJSONError checks the shape every error path in this middleware is
+// expected to produce: wantStatus, a JSON content type, and a non-empty
+// "error" field — not just a matching status code, since a generated
+// project's error responses should be consistently parseable.
+func assertJSONError(t *testing.T, rec *httptest.ResponseRecorder, wantStatus int) {
+	t.Helper()
+
+	if rec.Code != wantStatus {
+		t.Fatalf("status = %d, want %d", rec.Code, wantStatus)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("Content-Type = %q, want %q", ct, "application/json")
+	}
+
+	var body map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding error body: %v", err)
+	}
+	if body["error"] == "" {
+		t.Fatalf(`error body = %v, want a non-empty "error" field`, body)
+	}
 }
 
 func (s *fakeStore) Complete(_ context.Context, key string, resp StoredResponse, _ time.Duration) error {
@@ -63,6 +101,47 @@ func TestMiddlewareNoHeaderPassesThrough(t *testing.T) {
 	if len(store.records) != 0 {
 		t.Fatalf("store was touched: %v", store.records)
 	}
+}
+
+func TestMiddlewareBodyReadFailureRejectsWithJSONError(t *testing.T) {
+	store := newFakeStore()
+	called := false
+	handler := Middleware(Config{Store: store})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/payments", errReader{})
+	req.Header.Set("Idempotency-Key", "key-body-read-failure")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if called {
+		t.Fatal("handler should not be invoked when the request body can't be read")
+	}
+	assertJSONError(t, rec, http.StatusBadRequest)
+	if len(store.records) != 0 {
+		t.Fatalf("store was touched: %v", store.records)
+	}
+}
+
+func TestMiddlewareStoreErrorFailsClosed(t *testing.T) {
+	store := newFakeStore()
+	store.reserveErr = errors.New("redis unavailable")
+
+	called := false
+	handler := Middleware(Config{Store: store})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/payments", strings.NewReader("body"))
+	req.Header.Set("Idempotency-Key", "key-store-error")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if called {
+		t.Fatal("handler should not be invoked when the store errors (fail closed)")
+	}
+	assertJSONError(t, rec, http.StatusInternalServerError)
 }
 
 func TestMiddlewareFreshKeyInvokesHandlerAndCompletes(t *testing.T) {
@@ -165,9 +244,7 @@ func TestMiddlewareCompletedKeyDifferentHashConflicts(t *testing.T) {
 	if called {
 		t.Fatal("handler should not be invoked on hash mismatch")
 	}
-	if rec.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnprocessableEntity)
-	}
+	assertJSONError(t, rec, http.StatusUnprocessableEntity)
 }
 
 func TestMiddlewareInProgressKeySameHashConflicts(t *testing.T) {
@@ -193,9 +270,7 @@ func TestMiddlewareInProgressKeySameHashConflicts(t *testing.T) {
 	if called {
 		t.Fatal("handler should not be invoked while in progress")
 	}
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusConflict)
-	}
+	assertJSONError(t, rec, http.StatusConflict)
 }
 
 func TestMiddlewareInProgressKeyDifferentHashConflictsAsMismatch(t *testing.T) {
