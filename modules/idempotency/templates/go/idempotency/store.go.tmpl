@@ -1,0 +1,69 @@
+// Package idempotency implements idempotency-key middleware: a fresh POST,
+// PUT, or other unsafe request carrying an Idempotency-Key header is only
+// ever applied once, and repeats within the key's lifetime replay the
+// original response instead of re-executing the handler.
+package idempotency
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"net/http"
+	"time"
+)
+
+// Status is the lifecycle state of an idempotency record.
+type Status string
+
+const (
+	StatusInProgress Status = "in_progress"
+	StatusCompleted  Status = "completed"
+)
+
+// StoredResponse is a captured HTTP response, replayed verbatim on a repeat
+// request.
+type StoredResponse struct {
+	StatusCode int
+	Headers    http.Header
+	Body       []byte
+}
+
+// Record is one idempotency key's state.
+type Record struct {
+	Key         string
+	RequestHash string
+	Status      Status
+	Response    *StoredResponse // nil until Status == StatusCompleted
+	CreatedAt   time.Time
+}
+
+// Store persists idempotency records. Implementations must make Reserve
+// atomic: concurrent callers with the same fresh key must not both receive
+// reserved == true.
+type Store interface {
+	// Reserve claims key for the current request. If key is fresh, it is
+	// recorded in_progress with requestHash and ttl, and reserved is true.
+	// If key already exists, the existing record is returned unchanged and
+	// reserved is false.
+	Reserve(ctx context.Context, key, requestHash string, ttl time.Duration) (record Record, reserved bool, err error)
+
+	// Complete marks key completed with resp, replacing the in-progress TTL
+	// with ttl. It must succeed when called again on an already-completed
+	// key: a crash between Complete succeeding and the middleware returning
+	// to the client can cause exactly that retry.
+	Complete(ctx context.Context, key string, resp StoredResponse, ttl time.Duration) error
+}
+
+// HashRequest hashes method, path, and body so a replayed key can be
+// checked against the original request instead of trusted blindly. The
+// fields are separated by a NUL byte so, e.g., method "GE" + path "T/x"
+// can't collide with method "GET" + path "/x".
+func HashRequest(method, path string, body []byte) string {
+	h := sha256.New()
+	h.Write([]byte(method))
+	h.Write([]byte{0})
+	h.Write([]byte(path))
+	h.Write([]byte{0})
+	h.Write(body)
+	return hex.EncodeToString(h.Sum(nil))
+}
