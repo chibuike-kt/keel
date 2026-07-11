@@ -35,7 +35,7 @@ func Middleware(cfg Config) func(http.Handler) http.Handler {
 
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
-				http.Error(w, "failed to read request body", http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, "failed to read request body")
 				return
 			}
 			r.Body = io.NopCloser(bytes.NewReader(body))
@@ -44,7 +44,7 @@ func Middleware(cfg Config) func(http.Handler) http.Handler {
 
 			record, reserved, err := cfg.Store.Reserve(r.Context(), key, hash, cfg.ReserveTTL)
 			if err != nil {
-				http.Error(w, "idempotency store unavailable", http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, "idempotency store unavailable")
 				return
 			}
 
