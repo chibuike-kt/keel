@@ -1,0 +1,169 @@
+package idempotency
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+// RedisStore is a Store backed by Redis. Reserve uses a single Lua script
+// so the existence check and the initial record write happen atomically —
+// two concurrent Reserve calls on the same fresh key can never both see
+// reserved == true.
+type RedisStore struct {
+	client    *redis.Client
+	keyPrefix string
+}
+
+// NewRedisStore returns a RedisStore. keyPrefix namespaces every key this
+// store touches, so multiple stores can share one Redis instance.
+func NewRedisStore(client *redis.Client, keyPrefix string) *RedisStore {
+	return &RedisStore{client: client, keyPrefix: keyPrefix}
+}
+
+func (s *RedisStore) redisKey(key string) string {
+	return s.keyPrefix + key
+}
+
+const (
+	fieldHash       = "hash"
+	fieldStatus     = "status"
+	fieldCreatedAt  = "created_at"
+	fieldStatusCode = "status_code"
+	fieldHeaders    = "headers"
+	fieldBody       = "body"
+)
+
+// reserveScript atomically checks whether key exists and, if not, writes the
+// initial in_progress record. A bare SETNX can't express this: the record
+// needs several fields written together with the existence check, or two
+// concurrent callers on a brand-new key could both slip through between the
+// check and the write.
+var reserveScript = redis.NewScript(`
+if redis.call("EXISTS", KEYS[1]) == 1 then
+	return redis.call("HGETALL", KEYS[1])
+end
+redis.call("HSET", KEYS[1], "hash", ARGV[1], "status", "in_progress", "created_at", ARGV[2])
+redis.call("EXPIRE", KEYS[1], ARGV[3])
+return {}
+`)
+
+// Reserve implements Store.
+func (s *RedisStore) Reserve(ctx context.Context, key, requestHash string, ttl time.Duration) (Record, bool, error) {
+	createdAt := time.Now().UTC()
+	redisKey := s.redisKey(key)
+
+	res, err := reserveScript.Run(ctx, s.client, []string{redisKey},
+		requestHash, createdAt.Format(time.RFC3339Nano), int(ttl.Seconds()),
+	).Result()
+	if err != nil {
+		return Record{}, false, fmt.Errorf("idempotency: reserve %q: %w", key, err)
+	}
+
+	fields, ok := res.([]interface{})
+	if !ok {
+		return Record{}, false, fmt.Errorf("idempotency: reserve %q: unexpected script result %T", key, res)
+	}
+
+	if len(fields) == 0 {
+		return Record{
+			Key:         key,
+			RequestHash: requestHash,
+			Status:      StatusInProgress,
+			CreatedAt:   createdAt,
+		}, true, nil
+	}
+
+	record, err := recordFromFields(key, fields)
+	if err != nil {
+		return Record{}, false, fmt.Errorf("idempotency: reserve %q: %w", key, err)
+	}
+	return record, false, nil
+}
+
+// Complete implements Store. It tolerates being called on an
+// already-completed key: a crash between Complete succeeding and the
+// middleware returning to the client can cause exactly this retry, and it
+// must be a no-op in effect, not an error.
+func (s *RedisStore) Complete(ctx context.Context, key string, resp StoredResponse, ttl time.Duration) error {
+	headers, err := json.Marshal(resp.Headers)
+	if err != nil {
+		return fmt.Errorf("idempotency: complete %q: marshal headers: %w", key, err)
+	}
+
+	redisKey := s.redisKey(key)
+	_, err = s.client.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		pipe.HSet(ctx, redisKey,
+			fieldStatus, string(StatusCompleted),
+			fieldStatusCode, strconv.Itoa(resp.StatusCode),
+			fieldHeaders, headers,
+			fieldBody, resp.Body,
+		)
+		pipe.Expire(ctx, redisKey, ttl)
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("idempotency: complete %q: %w", key, err)
+	}
+	return nil
+}
+
+func recordFromFields(key string, fields []interface{}) (Record, error) {
+	m := make(map[string]string, len(fields)/2)
+	for i := 0; i+1 < len(fields); i += 2 {
+		k, ok := fields[i].(string)
+		if !ok {
+			return Record{}, fmt.Errorf("field name %v is not a string", fields[i])
+		}
+		v, ok := fields[i+1].(string)
+		if !ok {
+			return Record{}, fmt.Errorf("field %q value is not a string", k)
+		}
+		m[k] = v
+	}
+
+	createdAt, err := time.Parse(time.RFC3339Nano, m[fieldCreatedAt])
+	if err != nil {
+		return Record{}, fmt.Errorf("parsing %s: %w", fieldCreatedAt, err)
+	}
+
+	record := Record{
+		Key:         key,
+		RequestHash: m[fieldHash],
+		Status:      Status(m[fieldStatus]),
+		CreatedAt:   createdAt,
+	}
+
+	if record.Status == StatusCompleted {
+		resp, err := responseFromFields(m)
+		if err != nil {
+			return Record{}, err
+		}
+		record.Response = resp
+	}
+
+	return record, nil
+}
+
+func responseFromFields(m map[string]string) (*StoredResponse, error) {
+	statusCode, err := strconv.Atoi(m[fieldStatusCode])
+	if err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", fieldStatusCode, err)
+	}
+
+	var headers http.Header
+	if err := json.Unmarshal([]byte(m[fieldHeaders]), &headers); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", fieldHeaders, err)
+	}
+
+	return &StoredResponse{
+		StatusCode: statusCode,
+		Headers:    headers,
+		Body:       []byte(m[fieldBody]),
+	}, nil
+}

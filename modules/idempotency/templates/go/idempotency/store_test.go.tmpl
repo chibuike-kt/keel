@@ -1,0 +1,35 @@
+package idempotency
+
+import "testing"
+
+func TestHashRequestDeterministic(t *testing.T) {
+	h1 := HashRequest("POST", "/payments", []byte(`{"amount":100}`))
+	h2 := HashRequest("POST", "/payments", []byte(`{"amount":100}`))
+	if h1 != h2 {
+		t.Fatalf("HashRequest is not deterministic: %q != %q", h1, h2)
+	}
+}
+
+func TestHashRequestDiffersByMethod(t *testing.T) {
+	a := HashRequest("POST", "/payments", []byte("body"))
+	b := HashRequest("GET", "/payments", []byte("body"))
+	if a == b {
+		t.Fatal("HashRequest did not change with method")
+	}
+}
+
+func TestHashRequestDiffersByPath(t *testing.T) {
+	a := HashRequest("POST", "/payments", []byte("body"))
+	b := HashRequest("POST", "/refunds", []byte("body"))
+	if a == b {
+		t.Fatal("HashRequest did not change with path")
+	}
+}
+
+func TestHashRequestDiffersByBody(t *testing.T) {
+	a := HashRequest("POST", "/payments", []byte("body-a"))
+	b := HashRequest("POST", "/payments", []byte("body-b"))
+	if a == b {
+		t.Fatal("HashRequest did not change with body")
+	}
+}

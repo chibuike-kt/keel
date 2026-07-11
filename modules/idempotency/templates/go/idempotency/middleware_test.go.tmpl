@@ -1,0 +1,258 @@
+package idempotency
+
+import (
+	"bytes"
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+type fakeStore struct {
+	mu      sync.Mutex
+	records map[string]Record
+}
+
+func newFakeStore() *fakeStore {
+	return &fakeStore{records: make(map[string]Record)}
+}
+
+func (s *fakeStore) Reserve(_ context.Context, key, requestHash string, _ time.Duration) (Record, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if existing, ok := s.records[key]; ok {
+		return existing, false, nil
+	}
+
+	record := Record{Key: key, RequestHash: requestHash, Status: StatusInProgress, CreatedAt: time.Now()}
+	s.records[key] = record
+	return record, true, nil
+}
+
+func (s *fakeStore) Complete(_ context.Context, key string, resp StoredResponse, _ time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	record := s.records[key]
+	record.Status = StatusCompleted
+	record.Response = &resp
+	s.records[key] = record
+	return nil
+}
+
+func TestMiddlewareNoHeaderPassesThrough(t *testing.T) {
+	store := newFakeStore()
+	called := false
+	handler := Middleware(Config{Store: store})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/payments", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if !called {
+		t.Fatal("handler was not called")
+	}
+	if len(store.records) != 0 {
+		t.Fatalf("store was touched: %v", store.records)
+	}
+}
+
+func TestMiddlewareFreshKeyInvokesHandlerAndCompletes(t *testing.T) {
+	store := newFakeStore()
+	calls := 0
+	handler := Middleware(Config{Store: store, ReserveTTL: time.Minute, CompletedTTL: time.Hour})(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			w.Header().Set("X-Test", "yes")
+			w.WriteHeader(http.StatusCreated)
+			w.Write([]byte("created"))
+		}),
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/payments", strings.NewReader("body"))
+	req.Header.Set("Idempotency-Key", "key-1")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if calls != 1 {
+		t.Fatalf("handler called %d times, want 1", calls)
+	}
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusCreated)
+	}
+	if rec.Body.String() != "created" {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+
+	record := store.records["key-1"]
+	if record.Status != StatusCompleted {
+		t.Fatalf("record status = %q, want completed", record.Status)
+	}
+	if record.Response == nil || record.Response.StatusCode != http.StatusCreated || string(record.Response.Body) != "created" {
+		t.Fatalf("stored response = %+v", record.Response)
+	}
+	if record.Response.Headers.Get("X-Test") != "yes" {
+		t.Fatalf("stored headers = %v", record.Response.Headers)
+	}
+}
+
+func TestMiddlewareCompletedKeySameHashReplays(t *testing.T) {
+	store := newFakeStore()
+	body := []byte("body")
+	hash := HashRequest(http.MethodPost, "/payments", body)
+	store.records["key-2"] = Record{
+		Key:         "key-2",
+		RequestHash: hash,
+		Status:      StatusCompleted,
+		Response: &StoredResponse{
+			StatusCode: http.StatusCreated,
+			Headers:    http.Header{"X-Test": []string{"replayed"}},
+			Body:       []byte("original response"),
+		},
+	}
+
+	called := false
+	handler := Middleware(Config{Store: store})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/payments", bytes.NewReader(body))
+	req.Header.Set("Idempotency-Key", "key-2")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if called {
+		t.Fatal("handler should not be invoked on replay")
+	}
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusCreated)
+	}
+	if rec.Body.String() != "original response" {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+	if rec.Header().Get("X-Test") != "replayed" {
+		t.Fatalf("headers = %v", rec.Header())
+	}
+}
+
+func TestMiddlewareCompletedKeyDifferentHashConflicts(t *testing.T) {
+	store := newFakeStore()
+	store.records["key-3"] = Record{
+		Key:         "key-3",
+		RequestHash: "different-hash",
+		Status:      StatusCompleted,
+		Response:    &StoredResponse{StatusCode: http.StatusOK, Body: []byte("x")},
+	}
+
+	called := false
+	handler := Middleware(Config{Store: store})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/payments", strings.NewReader("body"))
+	req.Header.Set("Idempotency-Key", "key-3")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if called {
+		t.Fatal("handler should not be invoked on hash mismatch")
+	}
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnprocessableEntity)
+	}
+}
+
+func TestMiddlewareInProgressKeySameHashConflicts(t *testing.T) {
+	store := newFakeStore()
+	body := []byte("body")
+	hash := HashRequest(http.MethodPost, "/payments", body)
+	store.records["key-4"] = Record{
+		Key:         "key-4",
+		RequestHash: hash,
+		Status:      StatusInProgress,
+	}
+
+	called := false
+	handler := Middleware(Config{Store: store})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/payments", bytes.NewReader(body))
+	req.Header.Set("Idempotency-Key", "key-4")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if called {
+		t.Fatal("handler should not be invoked while in progress")
+	}
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusConflict)
+	}
+}
+
+func TestMiddlewareInProgressKeyDifferentHashConflictsAsMismatch(t *testing.T) {
+	// A hash mismatch must win over in-progress: the original request being
+	// unfinished doesn't make a mismatched replay any less wrong, and 409
+	// ("try again later") would tell the client to retry into a failure
+	// that waiting can never fix — only a different key will.
+	store := newFakeStore()
+	store.records["key-5"] = Record{
+		Key:         "key-5",
+		RequestHash: "some-other-hash",
+		Status:      StatusInProgress,
+	}
+
+	called := false
+	handler := Middleware(Config{Store: store})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/payments", strings.NewReader("body"))
+	req.Header.Set("Idempotency-Key", "key-5")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if called {
+		t.Fatal("handler should not be invoked on hash mismatch")
+	}
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnprocessableEntity)
+	}
+}
+
+func TestMiddlewareConcurrentSameKeyOnlyOneHandlerCall(t *testing.T) {
+	store := newFakeStore()
+	var calls int32
+
+	handler := Middleware(Config{Store: store, ReserveTTL: time.Minute, CompletedTTL: time.Hour})(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&calls, 1)
+			w.WriteHeader(http.StatusOK)
+		}),
+	)
+
+	const n = 50
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodPost, "/payments", strings.NewReader("body"))
+			req.Header.Set("Idempotency-Key", "race-key")
+			handler.ServeHTTP(httptest.NewRecorder(), req)
+		}()
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("handler called %d times across %d concurrent requests, want exactly 1", got, n)
+	}
+}
