@@ -1,0 +1,102 @@
+package security
+
+import (
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestNewServerSetsDocumentedTimeouts(t *testing.T) {
+	srv := NewServer(":8080", http.NewServeMux())
+
+	if srv.Addr != ":8080" {
+		t.Fatalf("Addr = %q, want %q", srv.Addr, ":8080")
+	}
+	if srv.ReadHeaderTimeout != 5*time.Second {
+		t.Fatalf("ReadHeaderTimeout = %v, want %v", srv.ReadHeaderTimeout, 5*time.Second)
+	}
+	if srv.ReadTimeout != 10*time.Second {
+		t.Fatalf("ReadTimeout = %v, want %v", srv.ReadTimeout, 10*time.Second)
+	}
+	if srv.WriteTimeout != 30*time.Second {
+		t.Fatalf("WriteTimeout = %v, want %v", srv.WriteTimeout, 30*time.Second)
+	}
+	if srv.IdleTimeout != 120*time.Second {
+		t.Fatalf("IdleTimeout = %v, want %v", srv.IdleTimeout, 120*time.Second)
+	}
+}
+
+func TestMaxBodyBytesUnderLimitPassesThroughUnchanged(t *testing.T) {
+	const limit = 1024
+	body := "a small request body"
+
+	var gotBody []byte
+	handler := MaxBodyBytes(limit)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("handler: reading body: %v", err)
+		}
+		gotBody = b
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if string(gotBody) != body {
+		t.Fatalf("handler read %q, want %q", gotBody, body)
+	}
+}
+
+func TestMaxBodyBytesOverLimitTruncatesRead(t *testing.T) {
+	const limit = 10
+	oversizedBody := strings.Repeat("x", 100) // far over the limit
+
+	var readErr error
+	var gotBody []byte
+	handler := MaxBodyBytes(limit)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		gotBody = b
+		readErr = err
+
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(oversizedBody))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	// Precise about what actually enforces the limit here: this asserts
+	// the handler's own read of r.Body was truncated by
+	// http.MaxBytesReader's real behavior — a bounded partial read plus a
+	// *http.MaxBytesError — not that some pre-check on a client-supplied
+	// Content-Length header rejected the request before the handler ran
+	// at all.
+	if readErr == nil {
+		t.Fatal("handler's body read error = nil, want a *http.MaxBytesError")
+	}
+	var maxBytesErr *http.MaxBytesError
+	if !errors.As(readErr, &maxBytesErr) {
+		t.Fatalf("handler's body read error = %v (%T), want *http.MaxBytesError", readErr, readErr)
+	}
+	if len(gotBody) > limit {
+		t.Fatalf("handler read %d bytes, want at most %d (the oversized body must not reach the handler in full)", len(gotBody), limit)
+	}
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
+	}
+}
