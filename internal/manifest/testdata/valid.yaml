@@ -1,0 +1,26 @@
+apiVersion: keel/v1
+name: idempotency
+version: 1.0.0
+summary: Idempotency-key middleware that makes unsafe writes replay-safe.
+tags: [reliability, payments]
+
+requires: []
+conflicts: []
+
+languages:
+  go:
+    dependencies:
+      - module: github.com/redis/go-redis/v9
+        version: v9.5.1
+    templates:
+      - from: templates/go/middleware/idempotency.go.tmpl
+        to: internal/middleware/idempotency.go
+      - from: templates/go/middleware/idempotency_test.go.tmpl
+        to: internal/middleware/idempotency_test.go
+  typescript:
+    dependencies:
+      - package: ioredis
+        version: ^5.4.1
+    templates:
+      - from: templates/typescript/src/middleware/idempotency.ts.tmpl
+        to: src/middleware/idempotency.ts
