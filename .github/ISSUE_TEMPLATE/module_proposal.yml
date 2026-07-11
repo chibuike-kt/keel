@@ -1,0 +1,40 @@
+name: Module proposal
+description: Propose a new fintech pattern for Keel to generate.
+labels: [module, proposal]
+body:
+  - type: markdown
+    attributes:
+      value: A good proposal describes a pattern and its guarantees, not just a library to wrap.
+  - type: input
+    id: name
+    attributes:
+      label: Module name
+      placeholder: e.g. webhook-verify
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem it solves
+      description: What failure mode does this prevent in a payments backend?
+    validations:
+      required: true
+  - type: textarea
+    id: behaviour
+    attributes:
+      label: Behaviour and guarantees
+      description: What must hold true in every language this module supports?
+    validations:
+      required: true
+  - type: checkboxes
+    id: languages
+    attributes:
+      label: Target languages
+      options:
+        - label: Go
+        - label: TypeScript
+  - type: textarea
+    id: deps
+    attributes:
+      label: Dependencies
+      description: External packages this would introduce, per language.

@@ -1,0 +1,42 @@
+name: Bug report
+description: Report a defect in Keel or in generated output.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for the report. Fill in what you can — a reproduction helps most.
+  - type: input
+    id: version
+    attributes:
+      label: Keel version
+      placeholder: output of `keel --version`
+    validations:
+      required: true
+  - type: dropdown
+    id: target
+    attributes:
+      label: Target language
+      options:
+        - Go
+        - TypeScript
+        - Not applicable
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Exact command(s) and the module selection involved.
+      render: shell
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: OS and architecture; Go or Node version if relevant.
