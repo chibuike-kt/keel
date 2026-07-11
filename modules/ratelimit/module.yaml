@@ -1,0 +1,27 @@
+apiVersion: keel/v1
+name: ratelimit
+version: 0.1.0
+summary: Token-bucket rate limiting middleware with a pluggable store and configurable key extraction.
+tags: [reliability, payments]
+
+requires: []
+conflicts: []
+
+languages:
+  go:
+    dependencies:
+      - module: github.com/redis/go-redis/v9
+        version: v9.21.0
+    templates:
+      - from: templates/go/ratelimit/ratelimit.go.tmpl
+        to: internal/ratelimit/ratelimit.go
+      - from: templates/go/ratelimit/redis_store.go.tmpl
+        to: internal/ratelimit/redis_store.go
+      - from: templates/go/ratelimit/middleware.go.tmpl
+        to: internal/ratelimit/middleware.go
+      - from: templates/go/ratelimit/ratelimit_test.go.tmpl
+        to: internal/ratelimit/ratelimit_test.go
+      - from: templates/go/ratelimit/middleware_test.go.tmpl
+        to: internal/ratelimit/middleware_test.go
+      - from: templates/go/ratelimit/redis_store_test.go.tmpl
+        to: internal/ratelimit/redis_store_test.go
