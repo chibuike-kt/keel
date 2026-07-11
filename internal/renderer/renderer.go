@@ -5,10 +5,10 @@
 package renderer
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"fmt"
 
 	"github.com/chibuike-kt/keel/internal/resolver"
 )
@@ -59,7 +59,7 @@ func (r *Renderer) Render(plan *resolver.Plan, ctx Context, targetDir string) er
 		return err
 	}
 
-renameFailed := false
+	renameFailed := false
 	defer func() {
 		if renameFailed {
 			return
