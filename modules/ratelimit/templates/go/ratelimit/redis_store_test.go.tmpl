@@ -1,0 +1,268 @@
+package ratelimit
+
+import (
+	"context"
+	"os"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+// These tests exercise RedisStore against a real Redis instance. They are
+// skipped unless REDIS_URL is set — CI does not currently run a Redis
+// service container, so they're expected to skip there, not fail; wiring
+// up a container is future work, out of scope for this module.
+func newTestRedisStore(t *testing.T) (*RedisStore, func()) {
+	t.Helper()
+
+	url := os.Getenv("REDIS_URL")
+	if url == "" {
+		t.Skip("REDIS_URL not set; skipping Redis-backed rate limit test")
+	}
+
+	opts, err := redis.ParseURL(url)
+	if err != nil {
+		t.Fatalf("redis.ParseURL: %v", err)
+	}
+	client := redis.NewClient(opts)
+
+	ctx := context.Background()
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Fatalf("redis ping: %v", err)
+	}
+
+	prefix := "keel-test:ratelimit:"
+	store := NewRedisStore(client, prefix)
+
+	return store, func() {
+		client.Close()
+	}
+}
+
+func TestRedisStoreFreshKeyStartsFull(t *testing.T) {
+	store, cleanup := newTestRedisStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	key := uniqueKey(t)
+	defer store.client.Del(ctx, store.redisKey(key))
+
+	cfg := Config{Capacity: 3, RefillRate: 1}
+	result, err := store.Allow(ctx, key, cfg)
+	if err != nil {
+		t.Fatalf("Allow: %v", err)
+	}
+	if !result.Allowed {
+		t.Fatal("first Allow on a fresh key: Allowed = false, want true")
+	}
+	if result.Remaining != 2 {
+		t.Fatalf("Remaining = %d, want 2", result.Remaining)
+	}
+	if result.Limit != 3 {
+		t.Fatalf("Limit = %d, want 3", result.Limit)
+	}
+}
+
+func TestRedisStoreDrainsThenDenies(t *testing.T) {
+	store, cleanup := newTestRedisStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	key := uniqueKey(t)
+	defer store.client.Del(ctx, store.redisKey(key))
+
+	// A low refill rate keeps the elapsed real time this test takes to run
+	// from accidentally refilling a whole extra token.
+	cfg := Config{Capacity: 3, RefillRate: 0.001}
+
+	for i := 0; i < 3; i++ {
+		result, err := store.Allow(ctx, key, cfg)
+		if err != nil {
+			t.Fatalf("Allow #%d: %v", i, err)
+		}
+		if !result.Allowed {
+			t.Fatalf("Allow #%d: Allowed = false, want true", i)
+		}
+	}
+
+	result, err := store.Allow(ctx, key, cfg)
+	if err != nil {
+		t.Fatalf("Allow after drain: %v", err)
+	}
+	if result.Allowed {
+		t.Fatal("Allow after draining capacity: Allowed = true, want false")
+	}
+}
+
+func TestRedisStoreRefillsOverTime(t *testing.T) {
+	store, cleanup := newTestRedisStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	key := uniqueKey(t)
+	defer store.client.Del(ctx, store.redisKey(key))
+
+	base := time.Now()
+	store.now = func() time.Time { return base }
+
+	cfg := Config{Capacity: 2, RefillRate: 1} // 1 token/sec
+
+	for i := 0; i < 2; i++ {
+		result, err := store.Allow(ctx, key, cfg)
+		if err != nil {
+			t.Fatalf("Allow #%d: %v", i, err)
+		}
+		if !result.Allowed {
+			t.Fatalf("Allow #%d: Allowed = false, want true", i)
+		}
+	}
+
+	if result, err := store.Allow(ctx, key, cfg); err != nil {
+		t.Fatalf("Allow before refill: %v", err)
+	} else if result.Allowed {
+		t.Fatal("Allow before refill: Allowed = true, want false")
+	}
+
+	// Enough elapsed time to refill more than one token at 1/sec.
+	store.now = func() time.Time { return base.Add(1500 * time.Millisecond) }
+
+	result, err := store.Allow(ctx, key, cfg)
+	if err != nil {
+		t.Fatalf("Allow after refill: %v", err)
+	}
+	if !result.Allowed {
+		t.Fatal("Allow after refill: Allowed = false, want true — lazy refill math is wrong")
+	}
+}
+
+func TestRedisStoreDeniedResultIsSane(t *testing.T) {
+	store, cleanup := newTestRedisStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	key := uniqueKey(t)
+	defer store.client.Del(ctx, store.redisKey(key))
+
+	base := time.Now()
+	store.now = func() time.Time { return base }
+
+	cfg := Config{Capacity: 1, RefillRate: 1} // 1 token/sec
+
+	if result, err := store.Allow(ctx, key, cfg); err != nil {
+		t.Fatalf("Allow: %v", err)
+	} else if !result.Allowed {
+		t.Fatal("first Allow: Allowed = false, want true")
+	}
+
+	result, err := store.Allow(ctx, key, cfg)
+	if err != nil {
+		t.Fatalf("Allow (denied): %v", err)
+	}
+	if result.Allowed {
+		t.Fatal("second Allow: Allowed = true, want false")
+	}
+
+	// One token at one per second: about a second until the next token,
+	// and about a second until the bucket is back to full capacity.
+	if result.RetryAfter <= 0 || result.RetryAfter > 2*time.Second {
+		t.Fatalf("RetryAfter = %v, want roughly 1s", result.RetryAfter)
+	}
+	wantReset := base.Add(time.Second)
+	if diff := result.ResetAt.Sub(wantReset); diff < -100*time.Millisecond || diff > 100*time.Millisecond {
+		t.Fatalf("ResetAt = %v, want close to %v", result.ResetAt, wantReset)
+	}
+}
+
+func TestRedisStoreDeniedCallsPersistPartialRefill(t *testing.T) {
+	store, cleanup := newTestRedisStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	key := uniqueKey(t)
+	defer store.client.Del(ctx, store.redisKey(key))
+
+	base := time.Now()
+	store.now = func() time.Time { return base }
+
+	cfg := Config{Capacity: 1, RefillRate: 1} // 1 token/sec
+
+	if result, err := store.Allow(ctx, key, cfg); err != nil {
+		t.Fatalf("Allow: %v", err)
+	} else if !result.Allowed {
+		t.Fatal("first Allow: Allowed = false, want true")
+	}
+
+	// First denial, partway through the wait for the next token.
+	store.now = func() time.Time { return base.Add(300 * time.Millisecond) }
+	first, err := store.Allow(ctx, key, cfg)
+	if err != nil {
+		t.Fatalf("Allow (first denial): %v", err)
+	}
+	if first.Allowed {
+		t.Fatal("first denial: Allowed = true, want false")
+	}
+
+	// Advance further, but still not enough for a full token. This is the
+	// case that actually exercises the write-back-without-decrementing
+	// path: if the denied branch failed to persist the partially refilled
+	// token count (e.g. wrote back the pre-refill value instead of the
+	// computed one), this second denial's RetryAfter would come back
+	// unchanged instead of shorter — the bucket would look like it never
+	// made progress between the two denials.
+	store.now = func() time.Time { return base.Add(600 * time.Millisecond) }
+	second, err := store.Allow(ctx, key, cfg)
+	if err != nil {
+		t.Fatalf("Allow (second denial): %v", err)
+	}
+	if second.Allowed {
+		t.Fatal("second denial: Allowed = true, want false")
+	}
+
+	if second.RetryAfter >= first.RetryAfter {
+		t.Fatalf("RetryAfter did not shrink across denials: first = %v, second = %v — elapsed-time bookkeeping is not surviving the denied write-back",
+			first.RetryAfter, second.RetryAfter)
+	}
+}
+
+func TestRedisStoreConcurrentAllowAdmitsExactlyCapacity(t *testing.T) {
+	store, cleanup := newTestRedisStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	key := uniqueKey(t)
+	defer store.client.Del(ctx, store.redisKey(key))
+
+	const capacity = 10
+	cfg := Config{Capacity: capacity, RefillRate: 0} // no refill: isolate the atomic-decrement guarantee
+
+	const attempts = 50
+	var allowed int32
+	var wg sync.WaitGroup
+	wg.Add(attempts)
+	for i := 0; i < attempts; i++ {
+		go func() {
+			defer wg.Done()
+			result, err := store.Allow(ctx, key, cfg)
+			if err != nil {
+				t.Errorf("Allow: %v", err)
+				return
+			}
+			if result.Allowed {
+				atomic.AddInt32(&allowed, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&allowed); got != capacity {
+		t.Fatalf("allowed = %d across %d concurrent attempts, want exactly %d", got, attempts, capacity)
+	}
+}
+
+func uniqueKey(t *testing.T) string {
+	t.Helper()
+	return t.Name() + "-" + time.Now().Format("20060102150405.000000000")
+}

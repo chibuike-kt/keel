@@ -1,0 +1,126 @@
+package ratelimit
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"strconv"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+// RedisStore is a Store backed by Redis. Allow uses a single Lua script so
+// the refill-then-consume sequence happens atomically — two concurrent
+// Allow calls against a bucket with exactly one token left can never both
+// succeed.
+type RedisStore struct {
+	client    *redis.Client
+	keyPrefix string
+	now       func() time.Time // overridden in tests to control elapsed time
+}
+
+// NewRedisStore returns a RedisStore. keyPrefix namespaces every key this
+// store touches, so multiple stores can share one Redis instance.
+func NewRedisStore(client *redis.Client, keyPrefix string) *RedisStore {
+	return &RedisStore{client: client, keyPrefix: keyPrefix, now: time.Now}
+}
+
+func (s *RedisStore) redisKey(key string) string {
+	return s.keyPrefix + key
+}
+
+// allowScript atomically refills a bucket for elapsed time, then consumes
+// one token if available. Capacity, refill rate, and the current time are
+// passed in from Go rather than read with Redis's TIME command, so callers
+// (and tests) control elapsed time precisely instead of racing the Redis
+// server's clock.
+var allowScript = redis.NewScript(`
+local capacity = tonumber(ARGV[1])
+local refill_rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+
+local tokens = capacity
+local last_refill = now
+
+if redis.call("EXISTS", KEYS[1]) == 1 then
+	local vals = redis.call("HMGET", KEYS[1], "tokens", "last_refill")
+	tokens = tonumber(vals[1])
+	last_refill = tonumber(vals[2])
+end
+
+local elapsed = now - last_refill
+if elapsed < 0 then
+	elapsed = 0
+end
+tokens = math.min(capacity, tokens + elapsed * refill_rate)
+
+local allowed = 0
+if tokens >= 1 then
+	allowed = 1
+	tokens = tokens - 1
+end
+
+redis.call("HSET", KEYS[1], "tokens", tostring(tokens), "last_refill", tostring(now))
+
+if refill_rate > 0 then
+	-- Long enough for an idle bucket to expire instead of persisting
+	-- forever, but not so short it evicts mid-burst: the time to refill
+	-- from empty to full, plus a margin.
+	redis.call("EXPIRE", KEYS[1], math.ceil(capacity / refill_rate) + 60)
+end
+
+return {allowed, tostring(tokens)}
+`)
+
+// Allow implements Store.
+func (s *RedisStore) Allow(ctx context.Context, key string, cfg Config) (Result, error) {
+	now := s.now()
+	nowSeconds := float64(now.UnixNano()) / 1e9
+
+	res, err := allowScript.Run(ctx, s.client, []string{s.redisKey(key)},
+		cfg.Capacity, cfg.RefillRate, strconv.FormatFloat(nowSeconds, 'f', -1, 64),
+	).Result()
+	if err != nil {
+		return Result{}, fmt.Errorf("ratelimit: allow %q: %w", key, err)
+	}
+
+	vals, ok := res.([]interface{})
+	if !ok || len(vals) != 2 {
+		return Result{}, fmt.Errorf("ratelimit: allow %q: unexpected script result %T", key, res)
+	}
+
+	allowedInt, ok := vals[0].(int64)
+	if !ok {
+		return Result{}, fmt.Errorf("ratelimit: allow %q: unexpected allowed type %T", key, vals[0])
+	}
+	tokensStr, ok := vals[1].(string)
+	if !ok {
+		return Result{}, fmt.Errorf("ratelimit: allow %q: unexpected tokens type %T", key, vals[1])
+	}
+	tokens, err := strconv.ParseFloat(tokensStr, 64)
+	if err != nil {
+		return Result{}, fmt.Errorf("ratelimit: allow %q: parsing tokens: %w", key, err)
+	}
+
+	allowed := allowedInt == 1
+	result := Result{
+		Allowed:   allowed,
+		Remaining: int64(math.Floor(tokens)),
+		Limit:     cfg.Capacity,
+		ResetAt:   now,
+	}
+
+	if cfg.RefillRate > 0 {
+		result.ResetAt = now.Add(secondsToDuration((float64(cfg.Capacity) - tokens) / cfg.RefillRate))
+		if !allowed {
+			result.RetryAfter = secondsToDuration((1 - tokens) / cfg.RefillRate)
+		}
+	}
+
+	return result, nil
+}
+
+func secondsToDuration(seconds float64) time.Duration {
+	return time.Duration(seconds * float64(time.Second))
+}
