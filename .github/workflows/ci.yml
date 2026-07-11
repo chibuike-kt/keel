@@ -17,9 +17,19 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - uses: golangci/golangci-lint-action@v9
+      - name: Detect Go sources
+        id: gofiles
+        run: |
+          if [ -n "$(git ls-files '*.go' | head -n1)" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No Go sources yet — skipping lint."
+          fi
+      - if: steps.gofiles.outputs.present == 'true'
+        uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.12
+          version: v2.12.2
 
   test:
     name: Test
@@ -29,7 +39,17 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - run: go test -race ./...
+      - name: Detect Go sources
+        id: gofiles
+        run: |
+          if [ -n "$(git ls-files '*.go' | head -n1)" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No Go sources yet — skipping tests."
+          fi
+      - if: steps.gofiles.outputs.present == 'true'
+        run: go test -race ./...
 
   build:
     name: Build
