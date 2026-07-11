@@ -1,0 +1,64 @@
+package security
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestValidateHostAllowedPasses(t *testing.T) {
+	called := false
+	handler := ValidateHost("example.com", "api.example.com")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "example.com"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if !called {
+		t.Fatal("handler was not called for an allowed host")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+}
+
+func TestValidateHostDisallowedRejected(t *testing.T) {
+	called := false
+	handler := ValidateHost("example.com")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "evil.example.com"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if called {
+		t.Fatal("handler should not be invoked for a disallowed host")
+	}
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
+func TestValidateHostIsCaseInsensitive(t *testing.T) {
+	// Host headers are conventionally compared case-insensitively (DNS
+	// names have no case), and this middleware performs that
+	// normalization deliberately, not by accident.
+	handler := ValidateHost("example.com")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "EXAMPLE.COM"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (Host comparison must be case-insensitive)", rec.Code, http.StatusOK)
+	}
+}

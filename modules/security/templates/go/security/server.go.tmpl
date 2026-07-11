@@ -1,0 +1,59 @@
+package security
+
+import (
+	"net/http"
+	"time"
+)
+
+// NewServer returns an *http.Server for addr and handler, configured with
+// production-sane timeouts. Go's http.Server has no timeouts by default,
+// which leaves plain http.ListenAndServe open to Slowloris-class
+// connection exhaustion — a client that opens a connection and trickles
+// bytes (or sends none at all) can tie up a goroutine indefinitely (see
+// gosec rule G112). Callers needing different values should set them
+// explicitly on the returned *http.Server rather than this constructor
+// growing an options system for every field.
+func NewServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:    addr,
+		Handler: handler,
+		// Time to read request headers: generous for a slow client, tight
+		// enough that trickling headers in one byte at a time can't hold
+		// a connection open indefinitely.
+		ReadHeaderTimeout: 5 * time.Second,
+		// Time to read the full request, headers plus body: covers a
+		// reasonable upload window for a typical JSON API request on top
+		// of ReadHeaderTimeout.
+		ReadTimeout: 10 * time.Second,
+		// Time to write the response: generous for a slow client or a
+		// larger response body, without letting one connection occupy a
+		// worker forever.
+		WriteTimeout: 30 * time.Second,
+		// Time a keep-alive connection may sit idle between requests
+		// before the server closes it, so idle clients don't accumulate
+		// open file descriptors without bound.
+		IdleTimeout: 120 * time.Second,
+	}
+}
+
+// MaxBodyBytes returns middleware wrapping the request body in
+// http.MaxBytesReader with limit. A typical JSON API might use 1 << 20 (1
+// MiB) — this middleware always requires an explicit limit from the
+// caller rather than silently assuming one, since the right limit depends
+// entirely on what an endpoint actually accepts (a file upload endpoint
+// needs a much larger limit than a JSON API).
+//
+// http.MaxBytesReader does not pre-validate Content-Length — a spoofable,
+// client-supplied header — it enforces the limit against bytes actually
+// read. Once a handler's read of r.Body crosses limit, that Read call
+// returns a *http.MaxBytesError; check for it with errors.As and respond
+// http.StatusRequestEntityTooLarge, the same way this package's own tests
+// do.
+func MaxBodyBytes(limit int64) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.Body = http.MaxBytesReader(w, r.Body, limit)
+			next.ServeHTTP(w, r)
+		})
+	}
+}

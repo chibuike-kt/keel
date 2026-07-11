@@ -1,0 +1,133 @@
+package security
+
+import (
+	"errors"
+	"net/http"
+	"strings"
+)
+
+// CORSOption configures the middleware built by New.
+type CORSOption func(*corsConfig)
+
+type corsConfig struct {
+	origins     []string
+	credentials bool
+	methods     []string
+	headers     []string
+}
+
+var (
+	defaultCORSMethods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
+	defaultCORSHeaders = []string{"Content-Type", "Authorization"}
+)
+
+// WithOrigins sets the allowed request origins. An origin of "*" allows
+// any origin — but see New for why that can't be combined with
+// WithCredentials.
+func WithOrigins(origins ...string) CORSOption {
+	return func(c *corsConfig) {
+		c.origins = origins
+	}
+}
+
+// WithCredentials allows credentialed requests (cookies, HTTP auth) by
+// setting Access-Control-Allow-Credentials: true.
+func WithCredentials() CORSOption {
+	return func(c *corsConfig) {
+		c.credentials = true
+	}
+}
+
+// WithMethods sets the allowed request methods. If never called, New uses
+// a sane default: GET, POST, PUT, PATCH, DELETE, OPTIONS.
+func WithMethods(methods ...string) CORSOption {
+	return func(c *corsConfig) {
+		c.methods = methods
+	}
+}
+
+// WithHeaders sets the allowed request headers. If never called, New uses
+// a sane default: Content-Type, Authorization.
+func WithHeaders(headers ...string) CORSOption {
+	return func(c *corsConfig) {
+		c.headers = headers
+	}
+}
+
+// New builds CORS middleware from opts, or an error if the configuration
+// is invalid.
+//
+// There is no Enable/Disable here. A generated project that never calls
+// New, or never wires its result into a handler chain, has no CORS
+// behavior at all — inactive-until-configured falls out of the caller
+// simply not using it, not from an internal disabled flag this package
+// would have to remember to check.
+func New(opts ...CORSOption) (func(http.Handler) http.Handler, error) {
+	cfg := &corsConfig{
+		methods: defaultCORSMethods,
+		headers: defaultCORSHeaders,
+	}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+
+	wildcard := false
+	allowedOrigins := make(map[string]bool, len(cfg.origins))
+	for _, o := range cfg.origins {
+		if o == "*" {
+			wildcard = true
+		}
+		allowedOrigins[o] = true
+	}
+
+	// Meaningless per the CORS spec — browsers refuse to honor a wildcard
+	// origin on a credentialed request outright — so configuring this
+	// combination signals a real misunderstanding. It's a hard error here
+	// rather than a middleware that would silently never work as intended.
+	if wildcard && cfg.credentials {
+		return nil, errors.New("security: CORS origins containing \"*\" cannot be combined with WithCredentials")
+	}
+
+	allowMethods := strings.Join(cfg.methods, ", ")
+	allowHeaders := strings.Join(cfg.headers, ", ")
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			origin := r.Header.Get("Origin")
+			allowed := wildcard || (origin != "" && allowedOrigins[origin])
+
+			if allowed {
+				if wildcard && !cfg.credentials {
+					w.Header().Set("Access-Control-Allow-Origin", "*")
+				} else {
+					w.Header().Set("Access-Control-Allow-Origin", origin)
+					// Tells caches the response varies by Origin, so a
+					// response allowed for one origin is never served
+					// from cache to a different one.
+					w.Header().Add("Vary", "Origin")
+				}
+				if cfg.credentials {
+					w.Header().Set("Access-Control-Allow-Credentials", "true")
+				}
+			}
+
+			if r.Method == http.MethodOptions {
+				if allowed {
+					w.Header().Set("Access-Control-Allow-Methods", allowMethods)
+					w.Header().Set("Access-Control-Allow-Headers", allowHeaders)
+				}
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+
+			// A disallowed origin gets no CORS headers above, but the
+			// request still reaches next: CORS is enforced by the
+			// browser withholding the response from script, not by this
+			// server refusing to handle the request. Blocking it here
+			// would be a common CORS implementation bug, not a security
+			// improvement — the browser already does the actual
+			// enforcement for a simple request like this one.
+			next.ServeHTTP(w, r)
+		})
+	}, nil
+}

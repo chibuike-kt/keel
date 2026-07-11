@@ -1,0 +1,85 @@
+package security
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestDefaultHeadersSetsExactDocumentedHeaders(t *testing.T) {
+	handler := DefaultHeaders()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	want := map[string]string{
+		"Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+		"X-Content-Type-Options":    "nosniff",
+		"X-Frame-Options":           "DENY",
+		"Referrer-Policy":           "strict-origin-when-cross-origin",
+		"Permissions-Policy":        "geolocation=(), microphone=(), camera=()",
+	}
+	for header, wantValue := range want {
+		if got := rec.Header().Get(header); got != wantValue {
+			t.Errorf("%s = %q, want %q", header, got, wantValue)
+		}
+	}
+}
+
+func TestDefaultHeadersOmitsXXSSProtection(t *testing.T) {
+	// This is a deliberate, documented omission (see the comment in
+	// headers.go.tmpl), not a gap — assert it stays absent so a future
+	// edit doesn't silently reintroduce the deprecated header.
+	handler := DefaultHeaders()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if _, ok := rec.Result().Header["X-Xss-Protection"]; ok {
+		t.Fatalf("X-XSS-Protection = %q, want header absent entirely", rec.Header().Get("X-XSS-Protection"))
+	}
+}
+
+func TestWithCSPSetsExactPolicy(t *testing.T) {
+	const policy = "default-src 'self'; script-src 'self' https://js.stripe.com"
+	handler := WithCSP(policy)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if got := rec.Header().Get("Content-Security-Policy"); got != policy {
+		t.Fatalf("Content-Security-Policy = %q, want %q", got, policy)
+	}
+}
+
+func TestDefaultHeadersAndWithCSPComposeCorrectly(t *testing.T) {
+	const policy = "default-src 'self'"
+	called := false
+	handler := DefaultHeaders()(WithCSP(policy)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	})))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if !called {
+		t.Fatal("handler was not called")
+	}
+	if got := rec.Header().Get("Content-Security-Policy"); got != policy {
+		t.Fatalf("Content-Security-Policy = %q, want %q", got, policy)
+	}
+	if got := rec.Header().Get("X-Frame-Options"); got != "DENY" {
+		t.Fatalf("X-Frame-Options = %q, want %q (DefaultHeaders should still apply when chained)", got, "DENY")
+	}
+}
