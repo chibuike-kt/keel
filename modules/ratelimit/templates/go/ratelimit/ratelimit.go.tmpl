@@ -1,0 +1,141 @@
+// Package ratelimit implements token-bucket rate limiting: each key gets a
+// bucket holding up to Capacity tokens, refilling at RefillRate tokens per
+// second, and every admitted request consumes one token.
+package ratelimit
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"time"
+)
+
+// Config is a token bucket's shape: how large a burst it absorbs, and how
+// fast it recovers.
+type Config struct {
+	Capacity   int64   // max tokens (burst size)
+	RefillRate float64 // tokens added per second (sustained rate)
+}
+
+// Result is the outcome of one Allow call.
+type Result struct {
+	Allowed    bool
+	Remaining  int64
+	Limit      int64
+	RetryAfter time.Duration // 0 if Allowed; time until next token if not
+	ResetAt    time.Time     // when the bucket returns to full capacity
+}
+
+// Store manages token bucket state. Implementations must make Allow
+// atomic: concurrent callers against the same key must not both be
+// admitted when only one token remains.
+type Store interface {
+	// Allow attempts to consume one token from key's bucket, lazily
+	// refilling based on elapsed time since the bucket's last update
+	// before checking capacity. cfg defines this key's limit — callers may
+	// pass different cfg per key (e.g. tiered plans), or the same cfg for
+	// every call if a single global limit is wanted.
+	Allow(ctx context.Context, key string, cfg Config) (Result, error)
+}
+
+// KeyExtractor derives the rate-limit key from an incoming request.
+type KeyExtractor func(*http.Request) (string, error)
+
+// ByIP extracts the client IP from RemoteAddr, stripping the port.
+//
+// Behind a proxy or load balancer, RemoteAddr is the proxy's address, not
+// the client's. This intentionally does not fall back to
+// X-Forwarded-For: that header is client-spoofable, and this module has no
+// way to know whether the deployment actually sits behind a proxy it can
+// trust to set it honestly. Write a custom KeyExtractor if you need to
+// trust a specific forwarding header in your deployment.
+func ByIP() KeyExtractor {
+	return func(r *http.Request) (string, error) {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			// No port to strip (e.g. a unix socket address) — use the raw
+			// value rather than failing the request over a key-formatting
+			// detail unrelated to the client's actual behavior.
+			return r.RemoteAddr, nil
+		}
+		return host, nil
+	}
+}
+
+// ByHeader extracts the key from the named request header, erroring if
+// it's absent or empty rather than silently rate-limiting every caller
+// under the same shared key.
+func ByHeader(name string) KeyExtractor {
+	return func(r *http.Request) (string, error) {
+		v := r.Header.Get(name)
+		if v == "" {
+			return "", fmt.Errorf("ratelimit: header %q is required for rate limiting", name)
+		}
+		return v, nil
+	}
+}
+
+// ContextKey is the type ratelimit uses for its own request-context
+// values. It's exported so a generated project's auth middleware can set
+// UserIDContextKey or TenantIDContextKey directly with context.WithValue,
+// without needing WithUserID or WithTenantID.
+type ContextKey string
+
+const (
+	UserIDContextKey   ContextKey = "ratelimit.user_id"
+	TenantIDContextKey ContextKey = "ratelimit.tenant_id"
+)
+
+// WithUserID returns a context carrying userID for ByUserID to read. Wire
+// it in wherever the generated project authenticates a request.
+func WithUserID(ctx context.Context, userID string) context.Context {
+	return context.WithValue(ctx, UserIDContextKey, userID)
+}
+
+// UserIDFromContext returns the user ID set by WithUserID, and whether one
+// was set. This is the expected wiring point for anything that needs to
+// read the authenticated user ID ByUserID rate-limits on.
+func UserIDFromContext(ctx context.Context) (string, bool) {
+	v, ok := ctx.Value(UserIDContextKey).(string)
+	return v, ok
+}
+
+// WithTenantID returns a context carrying tenantID for ByTenantID to read.
+func WithTenantID(ctx context.Context, tenantID string) context.Context {
+	return context.WithValue(ctx, TenantIDContextKey, tenantID)
+}
+
+// TenantIDFromContext returns the tenant ID set by WithTenantID, and
+// whether one was set.
+func TenantIDFromContext(ctx context.Context) (string, bool) {
+	v, ok := ctx.Value(TenantIDContextKey).(string)
+	return v, ok
+}
+
+// ByUserID extracts the key from the request context, as set by
+// WithUserID. It errors when the context hasn't been populated — silently
+// rate-limiting every request under the same empty-string key would be a
+// much worse failure mode than a loud error at wiring time.
+func ByUserID() KeyExtractor {
+	return func(r *http.Request) (string, error) {
+		userID, ok := UserIDFromContext(r.Context())
+		if !ok || userID == "" {
+			return "", fmt.Errorf("ratelimit: no user ID in request context; call ratelimit.WithUserID before this middleware runs")
+		}
+		return userID, nil
+	}
+}
+
+// ByTenantID extracts the key from the request context, as set by
+// WithTenantID. See ByUserID for why an unpopulated context is an error,
+// not a shared fallback key.
+func ByTenantID() KeyExtractor {
+	return func(r *http.Request) (string, error) {
+		tenantID, ok := TenantIDFromContext(r.Context())
+		if !ok || tenantID == "" {
+			return "", fmt.Errorf("ratelimit: no tenant ID in request context; call ratelimit.WithTenantID before this middleware runs")
+		}
+		return tenantID, nil
+	}
+}

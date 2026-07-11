@@ -1,0 +1,96 @@
+package ratelimit
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestByIPStripsPort(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "203.0.113.5:54321"
+
+	key, err := ByIP()(req)
+	if err != nil {
+		t.Fatalf("ByIP: %v", err)
+	}
+	if key != "203.0.113.5" {
+		t.Fatalf("key = %q, want %q", key, "203.0.113.5")
+	}
+}
+
+func TestByIPFallsBackToRawAddrWithoutPort(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "no-port-here"
+
+	key, err := ByIP()(req)
+	if err != nil {
+		t.Fatalf("ByIP: %v", err)
+	}
+	if key != "no-port-here" {
+		t.Fatalf("key = %q, want %q", key, "no-port-here")
+	}
+}
+
+func TestByHeaderExtractsValue(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-API-Key", "client-123")
+
+	key, err := ByHeader("X-API-Key")(req)
+	if err != nil {
+		t.Fatalf("ByHeader: %v", err)
+	}
+	if key != "client-123" {
+		t.Fatalf("key = %q, want %q", key, "client-123")
+	}
+}
+
+func TestByHeaderErrorsWhenMissing(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+
+	if _, err := ByHeader("X-API-Key")(req); err == nil {
+		t.Fatal("ByHeader() error = nil, want an error for a missing header")
+	}
+}
+
+func TestByUserIDExtractsFromContext(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req = req.WithContext(WithUserID(req.Context(), "user-42"))
+
+	key, err := ByUserID()(req)
+	if err != nil {
+		t.Fatalf("ByUserID: %v", err)
+	}
+	if key != "user-42" {
+		t.Fatalf("key = %q, want %q", key, "user-42")
+	}
+}
+
+func TestByUserIDErrorsWhenContextUnpopulated(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+
+	if _, err := ByUserID()(req); err == nil {
+		t.Fatal("ByUserID() error = nil, want an error when the context has no user ID")
+	}
+}
+
+func TestByTenantIDExtractsFromContext(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req = req.WithContext(WithTenantID(req.Context(), "tenant-7"))
+
+	key, err := ByTenantID()(req)
+	if err != nil {
+		t.Fatalf("ByTenantID: %v", err)
+	}
+	if key != "tenant-7" {
+		t.Fatalf("key = %q, want %q", key, "tenant-7")
+	}
+}
+
+func TestByTenantIDErrorsWhenContextUnpopulated(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+
+	if _, err := ByTenantID()(req); err == nil {
+		t.Fatal("ByTenantID() error = nil, want an error when the context has no tenant ID")
+	}
+}
