@@ -1,0 +1,160 @@
+package webhook
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"net/http"
+	"testing"
+	"time"
+)
+
+func stripeSignature(secret string, timestamp int64, body []byte) string {
+	signedPayload := fmt.Sprintf("%d.%s", timestamp, body)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(signedPayload))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func stripeHeaders(secret string, timestamp int64, body []byte) http.Header {
+	h := make(http.Header)
+	h.Set("Stripe-Signature", fmt.Sprintf("t=%d,v1=%s", timestamp, stripeSignature(secret, timestamp, body)))
+	return h
+}
+
+func TestProviderStripeValidSignatureAccepted(t *testing.T) {
+	const secret = "whsec_test"
+	body := []byte(`{"id":"evt_1"}`)
+	fixedNow := time.Unix(1_700_000_000, 0)
+
+	v := ProviderStripe(secret).(*stripeVerifier)
+	v.now = func() time.Time { return fixedNow }
+
+	if err := v.Verify(body, stripeHeaders(secret, fixedNow.Unix(), body)); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+}
+
+func TestProviderStripeTamperedBodyRejected(t *testing.T) {
+	const secret = "whsec_test"
+	signedBody := []byte(`{"id":"evt_1"}`)
+	tamperedBody := []byte(`{"id":"evt_2"}`)
+	fixedNow := time.Unix(1_700_000_000, 0)
+
+	v := ProviderStripe(secret).(*stripeVerifier)
+	v.now = func() time.Time { return fixedNow }
+
+	err := v.Verify(tamperedBody, stripeHeaders(secret, fixedNow.Unix(), signedBody))
+	if !errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("Verify() error = %v, want ErrInvalidSignature", err)
+	}
+}
+
+func TestProviderStripeWrongSecretRejected(t *testing.T) {
+	body := []byte(`{"id":"evt_1"}`)
+	fixedNow := time.Unix(1_700_000_000, 0)
+
+	v := ProviderStripe("whsec_correct").(*stripeVerifier)
+	v.now = func() time.Time { return fixedNow }
+
+	err := v.Verify(body, stripeHeaders("whsec_wrong", fixedNow.Unix(), body))
+	if !errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("Verify() error = %v, want ErrInvalidSignature", err)
+	}
+}
+
+func TestProviderStripeMissingHeader(t *testing.T) {
+	v := ProviderStripe("whsec_test")
+	err := v.Verify([]byte("body"), make(http.Header))
+	if !errors.Is(err, ErrMissingHeader) {
+		t.Fatalf("Verify() error = %v, want ErrMissingHeader", err)
+	}
+}
+
+func TestProviderStripeMalformedHeaderMissingTimestamp(t *testing.T) {
+	v := ProviderStripe("whsec_test")
+	h := make(http.Header)
+	h.Set("Stripe-Signature", "v1=deadbeef")
+
+	err := v.Verify([]byte("body"), h)
+	if !errors.Is(err, ErrMalformedHeader) {
+		t.Fatalf("Verify() error = %v, want ErrMalformedHeader", err)
+	}
+}
+
+func TestProviderStripeMalformedHeaderMissingSignature(t *testing.T) {
+	v := ProviderStripe("whsec_test")
+	h := make(http.Header)
+	h.Set("Stripe-Signature", "t=1700000000")
+
+	err := v.Verify([]byte("body"), h)
+	if !errors.Is(err, ErrMalformedHeader) {
+		t.Fatalf("Verify() error = %v, want ErrMalformedHeader", err)
+	}
+}
+
+func TestProviderStripeTimestampOutsideToleranceRejected(t *testing.T) {
+	const secret = "whsec_test"
+	body := []byte(`{"id":"evt_1"}`)
+	fixedNow := time.Unix(1_700_000_000, 0)
+	staleTimestamp := fixedNow.Add(-10 * time.Minute).Unix() // default tolerance is 5m
+
+	v := ProviderStripe(secret).(*stripeVerifier)
+	v.now = func() time.Time { return fixedNow }
+
+	err := v.Verify(body, stripeHeaders(secret, staleTimestamp, body))
+	if !errors.Is(err, ErrStaleTimestamp) {
+		t.Fatalf("Verify() error = %v, want ErrStaleTimestamp", err)
+	}
+}
+
+func TestProviderStripeTimestampInsideToleranceAccepted(t *testing.T) {
+	const secret = "whsec_test"
+	body := []byte(`{"id":"evt_1"}`)
+	fixedNow := time.Unix(1_700_000_000, 0)
+	recentTimestamp := fixedNow.Add(-2 * time.Minute).Unix()
+
+	v := ProviderStripe(secret).(*stripeVerifier)
+	v.now = func() time.Time { return fixedNow }
+
+	if err := v.Verify(body, stripeHeaders(secret, recentTimestamp, body)); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+}
+
+func TestProviderStripeCustomToleranceRespected(t *testing.T) {
+	const secret = "whsec_test"
+	body := []byte(`{"id":"evt_1"}`)
+	fixedNow := time.Unix(1_700_000_000, 0)
+	timestamp := fixedNow.Add(-2 * time.Minute).Unix()
+
+	v := ProviderStripe(secret, WithTolerance(time.Minute)).(*stripeVerifier)
+	v.now = func() time.Time { return fixedNow }
+
+	err := v.Verify(body, stripeHeaders(secret, timestamp, body))
+	if !errors.Is(err, ErrStaleTimestamp) {
+		t.Fatalf("Verify() error = %v, want ErrStaleTimestamp with a 1-minute tolerance", err)
+	}
+}
+
+func TestProviderStripeMatchesAnyV1DuringSecretRotation(t *testing.T) {
+	const oldSecret = "whsec_old"
+	const newSecret = "whsec_new"
+	body := []byte(`{"id":"evt_1"}`)
+	fixedNow := time.Unix(1_700_000_000, 0)
+	timestamp := fixedNow.Unix()
+
+	oldSig := stripeSignature(oldSecret, timestamp, body)
+	newSig := stripeSignature(newSecret, timestamp, body)
+	h := make(http.Header)
+	h.Set("Stripe-Signature", fmt.Sprintf("t=%d,v1=%s,v1=%s", timestamp, oldSig, newSig))
+
+	v := ProviderStripe(newSecret).(*stripeVerifier)
+	v.now = func() time.Time { return fixedNow }
+
+	if err := v.Verify(body, h); err != nil {
+		t.Fatalf("Verify() = %v, want nil (should match the new secret's v1 among several)", err)
+	}
+}
