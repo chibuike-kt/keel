@@ -1,0 +1,147 @@
+package ratelimit
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+type fakeStore struct {
+	result Result
+	err    error
+	calls  int32
+}
+
+func (s *fakeStore) Allow(_ context.Context, _ string, _ Config) (Result, error) {
+	atomic.AddInt32(&s.calls, 1)
+	return s.result, s.err
+}
+
+func fixedExtractor(key string) KeyExtractor {
+	return func(*http.Request) (string, error) { return key, nil }
+}
+
+func TestMiddlewareAllowedRequest(t *testing.T) {
+	resetAt := time.Now().Add(time.Minute).Truncate(time.Second)
+	store := &fakeStore{result: Result{Allowed: true, Remaining: 4, Limit: 5, ResetAt: resetAt}}
+
+	called := false
+	handler := Middleware(MiddlewareConfig{
+		Store:     store,
+		Extractor: fixedExtractor("client-1"),
+		Limit:     Config{Capacity: 5, RefillRate: 1},
+	})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if !called {
+		t.Fatal("handler was not called")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("X-RateLimit-Limit"); got != "5" {
+		t.Fatalf("X-RateLimit-Limit = %q, want %q", got, "5")
+	}
+	if got := rec.Header().Get("X-RateLimit-Remaining"); got != "4" {
+		t.Fatalf("X-RateLimit-Remaining = %q, want %q", got, "4")
+	}
+	if want := strconv.FormatInt(resetAt.Unix(), 10); rec.Header().Get("X-RateLimit-Reset") != want {
+		t.Fatalf("X-RateLimit-Reset = %q, want %q", rec.Header().Get("X-RateLimit-Reset"), want)
+	}
+}
+
+func TestMiddlewareDeniedRequest(t *testing.T) {
+	store := &fakeStore{result: Result{
+		Allowed:    false,
+		Remaining:  0,
+		Limit:      5,
+		RetryAfter: 2 * time.Second,
+		ResetAt:    time.Now().Add(3 * time.Second),
+	}}
+
+	called := false
+	handler := Middleware(MiddlewareConfig{
+		Store:     store,
+		Extractor: fixedExtractor("client-1"),
+		Limit:     Config{Capacity: 5, RefillRate: 1},
+	})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if called {
+		t.Fatal("handler should not be invoked when denied")
+	}
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusTooManyRequests)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "2" {
+		t.Fatalf("Retry-After = %q, want %q", got, "2")
+	}
+}
+
+func TestMiddlewareExtractorErrorRejectsWithoutCallingStore(t *testing.T) {
+	store := &fakeStore{result: Result{Allowed: true}}
+	extractor := func(*http.Request) (string, error) { return "", errors.New("missing header") }
+
+	called := false
+	handler := Middleware(MiddlewareConfig{
+		Store:     store,
+		Extractor: extractor,
+		Limit:     Config{Capacity: 5, RefillRate: 1},
+	})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if called {
+		t.Fatal("handler should not be invoked on extractor error")
+	}
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+	if atomic.LoadInt32(&store.calls) != 0 {
+		t.Fatalf("Store.Allow was called %d times, want 0", store.calls)
+	}
+}
+
+func TestMiddlewareStoreErrorFailsClosed(t *testing.T) {
+	store := &fakeStore{err: errors.New("redis unavailable")}
+
+	called := false
+	handler := Middleware(MiddlewareConfig{
+		Store:     store,
+		Extractor: fixedExtractor("client-1"),
+		Limit:     Config{Capacity: 5, RefillRate: 1},
+	})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if called {
+		t.Fatal("handler should not be invoked when the store errors (fail closed)")
+	}
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+}

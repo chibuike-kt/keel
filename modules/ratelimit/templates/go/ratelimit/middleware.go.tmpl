@@ -1,0 +1,66 @@
+package ratelimit
+
+import (
+	"encoding/json"
+	"math"
+	"net/http"
+	"strconv"
+)
+
+// MiddlewareConfig configures Middleware.
+type MiddlewareConfig struct {
+	Store     Store
+	Extractor KeyExtractor
+	Limit     Config // default Config applied to every key
+}
+
+// Middleware rate-limits every request through cfg.Extractor and
+// cfg.Store.
+//
+// If cfg.Store errors — e.g. Redis is unreachable — this fails CLOSED
+// (503) rather than open. Silently allowing unlimited traffic whenever the
+// limiter's backing store is down is the wrong default for a
+// payment-adjacent API: it trades away the one guarantee rate limiting
+// exists to provide, right when something is already wrong. That costs
+// availability during a store outage instead, which is the correct
+// trade-off here.
+func Middleware(cfg MiddlewareConfig) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			key, err := cfg.Extractor(r)
+			if err != nil {
+				writeJSONError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+
+			result, err := cfg.Store.Allow(r.Context(), key, cfg.Limit)
+			if err != nil {
+				writeJSONError(w, http.StatusServiceUnavailable, "rate limiter unavailable")
+				return
+			}
+
+			setRateLimitHeaders(w.Header(), result)
+
+			if !result.Allowed {
+				retryAfterSeconds := int(math.Ceil(result.RetryAfter.Seconds()))
+				w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds))
+				writeJSONError(w, http.StatusTooManyRequests, "rate limit exceeded")
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func setRateLimitHeaders(h http.Header, result Result) {
+	h.Set("X-RateLimit-Limit", strconv.FormatInt(result.Limit, 10))
+	h.Set("X-RateLimit-Remaining", strconv.FormatInt(result.Remaining, 10))
+	h.Set("X-RateLimit-Reset", strconv.FormatInt(result.ResetAt.Unix(), 10))
+}
+
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
+}
