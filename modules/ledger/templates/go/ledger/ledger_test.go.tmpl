@@ -1,0 +1,142 @@
+package ledger
+
+import "testing"
+
+func TestDebitNegatesAmount(t *testing.T) {
+	e := Debit(1, 100)
+	if e.AccountID != 1 || e.Amount != -100 {
+		t.Fatalf("Debit(1, 100) = %+v, want {AccountID:1 Amount:-100}", e)
+	}
+}
+
+func TestCreditKeepsAmountPositive(t *testing.T) {
+	e := Credit(1, 100)
+	if e.AccountID != 1 || e.Amount != 100 {
+		t.Fatalf("Credit(1, 100) = %+v, want {AccountID:1 Amount:100}", e)
+	}
+}
+
+func TestDebitPanicsOnNonPositiveAmount(t *testing.T) {
+	for _, amount := range []int64{0, -1} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("Debit(1, %d) did not panic", amount)
+				}
+			}()
+			Debit(1, amount)
+		}()
+	}
+}
+
+func TestCreditPanicsOnNonPositiveAmount(t *testing.T) {
+	for _, amount := range []int64{0, -1} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("Credit(1, %d) did not panic", amount)
+				}
+			}()
+			Credit(1, amount)
+		}()
+	}
+}
+
+func TestTransactionValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		txn     Transaction
+		wantErr bool
+	}{
+		{
+			name: "valid 2-leg transfer",
+			txn: Transaction{
+				Reference: "txn-1",
+				Entries:   []Entry{Debit(1, 100), Credit(2, 100)},
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid 3-leg customer/merchant/platform-fee",
+			txn: Transaction{
+				Reference: "txn-2",
+				Entries:   []Entry{Debit(1, 100), Credit(2, 95), Credit(3, 5)},
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid same account split across two debits",
+			txn: Transaction{
+				Reference: "txn-3",
+				// One logical -100 debit booked as two lines for separate
+				// bookkeeping reasons: legal, since the net effect on the
+				// account (-100) is nonzero.
+				Entries: []Entry{Debit(1, 60), Debit(1, 40), Credit(2, 100)},
+			},
+			wantErr: false,
+		},
+		{
+			name: "unbalanced",
+			txn: Transaction{
+				Reference: "txn-4",
+				Entries: []Entry{
+					{AccountID: 1, Amount: -100},
+					{AccountID: 2, Amount: 90},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "single entry",
+			txn: Transaction{
+				Reference: "txn-5",
+				Entries: []Entry{
+					{AccountID: 1, Amount: -100},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "no entries",
+			txn: Transaction{
+				Reference: "txn-6",
+				Entries:   nil,
+			},
+			wantErr: true,
+		},
+		{
+			name: "zero amount entry",
+			txn: Transaction{
+				Reference: "txn-7",
+				Entries: []Entry{
+					{AccountID: 1, Amount: 0},
+					{AccountID: 2, Amount: 0},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "same account entries net to a no-op leg",
+			txn: Transaction{
+				Reference: "txn-8",
+				// +50 and -50 on the same account cancel out entirely —
+				// meaningless padding, even though the transaction as a
+				// whole still sums to zero.
+				Entries: []Entry{
+					{AccountID: 1, Amount: 50},
+					{AccountID: 1, Amount: -50},
+				},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.txn.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}

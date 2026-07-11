@@ -1,0 +1,105 @@
+// Package ledger implements a Postgres-backed double-entry ledger. Every
+// invariant described here — balance, single currency, append-only
+// history, no unapproved overdraft — is enforced by the database schema in
+// migrations/0001_ledger_schema.sql, not just by this package. The checks
+// in this file are the fast, friendly path: they fail before a database
+// round trip where they can, but the schema is what makes them
+// unbreakable.
+package ledger
+
+import (
+	"fmt"
+	"time"
+)
+
+// Entry is one signed leg of a transaction: a negative Amount debits its
+// account, a positive Amount credits it.
+type Entry struct {
+	AccountID int64
+	Amount    int64 // signed minor units
+}
+
+// Debit returns an Entry that reduces accountID's balance by amount.
+// amount must be positive; Debit negates it. Callers should never
+// construct Entry directly with a hand-computed sign — a flipped sign here
+// would silently produce a valid-looking but wrong entry, not an obviously
+// broken one.
+func Debit(accountID int64, amount int64) Entry {
+	if amount <= 0 {
+		panic("ledger: Debit amount must be > 0")
+	}
+	return Entry{AccountID: accountID, Amount: -amount}
+}
+
+// Credit returns an Entry that increases accountID's balance by amount.
+// amount must be positive.
+func Credit(accountID int64, amount int64) Entry {
+	if amount <= 0 {
+		panic("ledger: Credit amount must be > 0")
+	}
+	return Entry{AccountID: accountID, Amount: amount}
+}
+
+// Transaction is a set of Entries to post atomically.
+type Transaction struct {
+	// Reference is the caller-supplied idempotency key. Posting the same
+	// Reference twice is rejected (ErrDuplicateReference), not silently
+	// merged or re-applied.
+	Reference   string
+	Description string
+	Entries     []Entry
+}
+
+// Validate checks a Transaction's own arithmetic before Post ever opens a
+// database connection. This is defense in depth, the same posture as the
+// manifest and renderer packages: never trust a later layer to catch what
+// an earlier one already can. It is not a substitute for the database's
+// deferred constraint triggers, which remain the actual enforcement.
+func (t Transaction) Validate() error {
+	if len(t.Entries) < 2 {
+		return fmt.Errorf("ledger: transaction must have at least 2 entries, got %d", len(t.Entries))
+	}
+
+	var sum int64
+	perAccount := make(map[int64]int64, len(t.Entries))
+	countByAccount := make(map[int64]int, len(t.Entries))
+
+	for i, e := range t.Entries {
+		if e.Amount == 0 {
+			return fmt.Errorf("ledger: entry %d has a zero amount", i)
+		}
+		sum += e.Amount
+		perAccount[e.AccountID] += e.Amount
+		countByAccount[e.AccountID]++
+	}
+
+	if sum != 0 {
+		return fmt.Errorf("ledger: entries do not sum to zero (sum = %d)", sum)
+	}
+
+	// The same account may legitimately appear more than once — e.g.
+	// splitting one debit across two bookkeeping reasons — as long as
+	// those entries still have a real, nonzero net effect on the account.
+	// An account whose repeated entries cancel out to exactly zero is a
+	// no-op leg: it does nothing but pad the transaction, and the overall
+	// sum-to-zero check above wouldn't catch it on its own.
+	for accountID, count := range countByAccount {
+		if count > 1 && perAccount[accountID] == 0 {
+			return fmt.Errorf("ledger: account %d has entries that net to zero within the transaction", accountID)
+		}
+	}
+
+	return nil
+}
+
+// Account mirrors one row of the accounts table.
+type Account struct {
+	ID          int64
+	ExternalRef string
+	Currency    string
+	// Balance is the cached projection of SUM(entries.amount) for this
+	// account, not an independent source of truth. See VerifyBalance.
+	Balance        int64
+	AllowOverdraft bool
+	CreatedAt      time.Time
+}

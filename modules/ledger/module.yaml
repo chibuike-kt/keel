@@ -1,0 +1,27 @@
+apiVersion: keel/v1
+name: ledger
+version: 0.1.0
+summary: Postgres-backed double-entry ledger with invariants enforced in the database, not just Go.
+tags: [payments, correctness]
+
+requires: []
+conflicts: []
+
+languages:
+  go:
+    dependencies:
+      - module: github.com/jackc/pgx/v5
+        version: v5.10.0
+    templates:
+      - from: templates/go/ledger/ledger.go.tmpl
+        to: internal/ledger/ledger.go
+      - from: templates/go/ledger/errors.go.tmpl
+        to: internal/ledger/errors.go
+      - from: templates/go/ledger/postgres.go.tmpl
+        to: internal/ledger/postgres.go
+      - from: templates/go/ledger/ledger_test.go.tmpl
+        to: internal/ledger/ledger_test.go
+      - from: templates/go/ledger/postgres_test.go.tmpl
+        to: internal/ledger/postgres_test.go
+      - from: migrations/0001_ledger_schema.sql
+        to: migrations/0001_ledger_schema.sql
