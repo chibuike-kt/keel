@@ -1,0 +1,376 @@
+package ledger
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// These tests exercise Ledger against a real Postgres instance with
+// migrations/0001_ledger_schema.sql applied. They're skipped unless
+// DATABASE_URL is set — CI does not currently run a Postgres service
+// container, so they're expected to skip there, not fail; wiring one up
+// is future work, out of scope for this module.
+func newTestLedger(t *testing.T) (*Ledger, *pgxpool.Pool) {
+	t.Helper()
+
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		t.Skip("DATABASE_URL not set; skipping Postgres-backed ledger test")
+	}
+
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatalf("ping: %v", err)
+	}
+
+	return New(pool), pool
+}
+
+func createAccount(t *testing.T, l *Ledger, externalRef, currency string, allowOverdraft bool) Account {
+	t.Helper()
+	a, err := l.CreateAccount(context.Background(), externalRef, currency, allowOverdraft)
+	if err != nil {
+		t.Fatalf("CreateAccount(%s): %v", externalRef, err)
+	}
+	return a
+}
+
+// uniqueRef gives every test its own external_ref / reference namespace, so
+// tests can run repeatedly against the same database without colliding on
+// the unique constraints.
+func uniqueRef(t *testing.T, suffix string) string {
+	t.Helper()
+	return fmt.Sprintf("%s-%s-%d", t.Name(), suffix, time.Now().UnixNano())
+}
+
+func TestLedgerTransferBetweenTwoAccounts(t *testing.T) {
+	l, _ := newTestLedger(t)
+	ctx := context.Background()
+
+	funding := createAccount(t, l, uniqueRef(t, "funding"), "USD", true)
+	a := createAccount(t, l, uniqueRef(t, "a"), "USD", false)
+	b := createAccount(t, l, uniqueRef(t, "b"), "USD", false)
+
+	if err := l.Transfer(ctx, funding.ID, a.ID, 1000, uniqueRef(t, "fund")); err != nil {
+		t.Fatalf("fund: %v", err)
+	}
+	if err := l.Transfer(ctx, a.ID, b.ID, 300, uniqueRef(t, "transfer")); err != nil {
+		t.Fatalf("transfer: %v", err)
+	}
+
+	if got, err := l.Balance(ctx, a.ID); err != nil {
+		t.Fatalf("Balance(a): %v", err)
+	} else if got != 700 {
+		t.Fatalf("balance a = %d, want 700", got)
+	}
+	if got, err := l.Balance(ctx, b.ID); err != nil {
+		t.Fatalf("Balance(b): %v", err)
+	} else if got != 300 {
+		t.Fatalf("balance b = %d, want 300", got)
+	}
+
+	for _, acc := range []Account{funding, a, b} {
+		cached, computed, err := l.VerifyBalance(ctx, acc.ID)
+		if err != nil {
+			t.Fatalf("VerifyBalance(%d): %v", acc.ID, err)
+		}
+		if cached != computed {
+			t.Fatalf("account %d: cached = %d, computed = %d, want equal", acc.ID, cached, computed)
+		}
+	}
+}
+
+func TestLedgerThreeLegTransaction(t *testing.T) {
+	l, _ := newTestLedger(t)
+	ctx := context.Background()
+
+	funding := createAccount(t, l, uniqueRef(t, "funding"), "USD", true)
+	customer := createAccount(t, l, uniqueRef(t, "customer"), "USD", false)
+	merchant := createAccount(t, l, uniqueRef(t, "merchant"), "USD", false)
+	platform := createAccount(t, l, uniqueRef(t, "platform"), "USD", false)
+
+	if err := l.Transfer(ctx, funding.ID, customer.ID, 1000, uniqueRef(t, "fund")); err != nil {
+		t.Fatalf("fund: %v", err)
+	}
+
+	err := l.Post(ctx, Transaction{
+		Reference: uniqueRef(t, "purchase"),
+		Entries: []Entry{
+			Debit(customer.ID, 100),
+			Credit(merchant.ID, 95),
+			Credit(platform.ID, 5),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+
+	wantBalances := map[int64]int64{customer.ID: 900, merchant.ID: 95, platform.ID: 5}
+	for id, want := range wantBalances {
+		got, err := l.Balance(ctx, id)
+		if err != nil {
+			t.Fatalf("Balance(%d): %v", id, err)
+		}
+		if got != want {
+			t.Fatalf("balance(%d) = %d, want %d", id, got, want)
+		}
+	}
+}
+
+func TestPostgresRejectsUnbalancedTransactionInsertedDirectly(t *testing.T) {
+	l, pool := newTestLedger(t)
+	ctx := context.Background()
+
+	a := createAccount(t, l, uniqueRef(t, "a"), "USD", true)
+	b := createAccount(t, l, uniqueRef(t, "b"), "USD", true)
+
+	// Bypasses Go's Validate() entirely — this is what actually proves the
+	// database enforces the invariant, not just Go's pre-check.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var txnID int64
+	if err := tx.QueryRow(ctx, `INSERT INTO transactions (reference) VALUES ($1) RETURNING id`,
+		uniqueRef(t, "unbalanced")).Scan(&txnID); err != nil {
+		t.Fatalf("insert transaction: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO entries (transaction_id, account_id, amount) VALUES ($1, $2, $3), ($1, $4, $5)`,
+		txnID, a.ID, int64(-50), b.ID, int64(40)); err != nil {
+		t.Fatalf("insert entries: %v", err)
+	}
+
+	if err := tx.Commit(ctx); err == nil {
+		t.Fatal("Commit() error = nil, want the deferred balance trigger to reject an unbalanced transaction")
+	}
+}
+
+func TestPostgresRejectsMutatingEntriesAndTransactions(t *testing.T) {
+	l, pool := newTestLedger(t)
+	ctx := context.Background()
+
+	a := createAccount(t, l, uniqueRef(t, "a"), "USD", true)
+	b := createAccount(t, l, uniqueRef(t, "b"), "USD", true)
+	ref := uniqueRef(t, "txn")
+	if err := l.Transfer(ctx, a.ID, b.ID, 100, ref); err != nil {
+		t.Fatalf("Transfer: %v", err)
+	}
+
+	var txnID, entryID int64
+	err := pool.QueryRow(ctx, `
+		SELECT t.id, e.id FROM transactions t JOIN entries e ON e.transaction_id = t.id
+		WHERE t.reference = $1 LIMIT 1
+	`, ref).Scan(&txnID, &entryID)
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+
+	if _, err := pool.Exec(ctx, `UPDATE entries SET amount = 999 WHERE id = $1`, entryID); err == nil {
+		t.Fatal("UPDATE entries: error = nil, want the append-only trigger to reject it")
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM entries WHERE id = $1`, entryID); err == nil {
+		t.Fatal("DELETE entries: error = nil, want the append-only trigger to reject it")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE transactions SET description = 'edited' WHERE id = $1`, txnID); err == nil {
+		t.Fatal("UPDATE transactions: error = nil, want the append-only trigger to reject it")
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM transactions WHERE id = $1`, txnID); err == nil {
+		t.Fatal("DELETE transactions: error = nil, want the append-only trigger to reject it")
+	}
+}
+
+func TestPostgresRejectsCurrencyMismatch(t *testing.T) {
+	l, pool := newTestLedger(t)
+	ctx := context.Background()
+
+	usd := createAccount(t, l, uniqueRef(t, "usd"), "USD", true)
+	eur := createAccount(t, l, uniqueRef(t, "eur"), "EUR", true)
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var txnID int64
+	if err := tx.QueryRow(ctx, `INSERT INTO transactions (reference) VALUES ($1) RETURNING id`,
+		uniqueRef(t, "mixed-currency")).Scan(&txnID); err != nil {
+		t.Fatalf("insert transaction: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO entries (transaction_id, account_id, amount) VALUES ($1, $2, $3), ($1, $4, $5)`,
+		txnID, usd.ID, int64(-50), eur.ID, int64(50)); err != nil {
+		t.Fatalf("insert entries: %v", err)
+	}
+
+	if err := tx.Commit(ctx); err == nil {
+		t.Fatal("Commit() error = nil, want the deferred currency trigger to reject a mixed-currency transaction")
+	}
+}
+
+func TestLedgerTransferInsufficientFundsFailsFast(t *testing.T) {
+	l, pool := newTestLedger(t)
+	ctx := context.Background()
+
+	a := createAccount(t, l, uniqueRef(t, "a"), "USD", false) // starts at 0, no overdraft
+	b := createAccount(t, l, uniqueRef(t, "b"), "USD", false)
+
+	ref := uniqueRef(t, "overdraft-attempt")
+	err := l.Transfer(ctx, a.ID, b.ID, 100, ref)
+	if !errors.Is(err, ErrInsufficientFunds) {
+		t.Fatalf("Transfer() error = %v, want ErrInsufficientFunds", err)
+	}
+
+	// Proves this was rejected before any write, not rolled back after
+	// one: nothing with this reference should exist at all.
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM transactions WHERE reference = $1`, ref).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("transactions with reference %q = %d, want 0", ref, count)
+	}
+}
+
+func TestPostgresRejectsOverdraftOnDirectUpdate(t *testing.T) {
+	l, pool := newTestLedger(t)
+	ctx := context.Background()
+
+	a := createAccount(t, l, uniqueRef(t, "a"), "USD", false)
+
+	// Bypasses Go's pre-check entirely — this is what actually proves the
+	// database trigger backstops the invariant rather than just Go's Post.
+	_, err := pool.Exec(ctx, `UPDATE accounts SET balance = -1 WHERE id = $1`, a.ID)
+	if err == nil {
+		t.Fatal("UPDATE accounts (direct): error = nil, want the overdraft trigger to reject it")
+	}
+}
+
+func TestLedgerOverdraftAllowedSucceeds(t *testing.T) {
+	l, _ := newTestLedger(t)
+	ctx := context.Background()
+
+	a := createAccount(t, l, uniqueRef(t, "a"), "USD", true)
+	b := createAccount(t, l, uniqueRef(t, "b"), "USD", true)
+
+	if err := l.Transfer(ctx, a.ID, b.ID, 100, uniqueRef(t, "overdraft")); err != nil {
+		t.Fatalf("Transfer: %v", err)
+	}
+
+	got, err := l.Balance(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("Balance(a): %v", err)
+	}
+	if got != -100 {
+		t.Fatalf("balance a = %d, want -100", got)
+	}
+}
+
+func TestLedgerConcurrentTransfersDoNotDeadlock(t *testing.T) {
+	l, _ := newTestLedger(t)
+	ctx := context.Background()
+
+	a := createAccount(t, l, uniqueRef(t, "a"), "USD", true)
+	b := createAccount(t, l, uniqueRef(t, "b"), "USD", true)
+
+	const n = 20
+	const amount = 10
+
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	wg.Add(n)
+	for i := range n {
+		go func(i int) {
+			defer wg.Done()
+
+			// Bounded, not indefinite: if the sorted-lock-order design
+			// didn't actually prevent deadlocks, this is what turns a hang
+			// into a failing test instead of one that never finishes.
+			runCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+
+			ref := uniqueRef(t, fmt.Sprintf("race-%d", i))
+			if i%2 == 0 {
+				errs[i] = l.Transfer(runCtx, a.ID, b.ID, amount, ref)
+			} else {
+				errs[i] = l.Transfer(runCtx, b.ID, a.ID, amount, ref)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("Transfer #%d: %v (deadlock, timeout, or another failure)", i, err)
+		}
+	}
+
+	balA, err := l.Balance(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("Balance(a): %v", err)
+	}
+	balB, err := l.Balance(ctx, b.ID)
+	if err != nil {
+		t.Fatalf("Balance(b): %v", err)
+	}
+
+	// Equal counts of transfers in each direction, same amount: net effect
+	// on each account is zero, and the total across both is conserved.
+	if balA != 0 || balB != 0 {
+		t.Fatalf("balances = (a=%d, b=%d), want (0, 0) after equal transfers in both directions", balA, balB)
+	}
+	if balA+balB != 0 {
+		t.Fatalf("total balance = %d, want 0 (money not conserved)", balA+balB)
+	}
+}
+
+func TestLedgerDuplicateReferenceRejected(t *testing.T) {
+	l, pool := newTestLedger(t)
+	ctx := context.Background()
+
+	a := createAccount(t, l, uniqueRef(t, "a"), "USD", true)
+	b := createAccount(t, l, uniqueRef(t, "b"), "USD", true)
+
+	ref := uniqueRef(t, "dup")
+	if err := l.Transfer(ctx, a.ID, b.ID, 50, ref); err != nil {
+		t.Fatalf("first Transfer: %v", err)
+	}
+
+	err := l.Transfer(ctx, a.ID, b.ID, 50, ref)
+	if !errors.Is(err, ErrDuplicateReference) {
+		t.Fatalf("second Transfer() error = %v, want ErrDuplicateReference", err)
+	}
+
+	var entryCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM entries e JOIN transactions t ON t.id = e.transaction_id
+		WHERE t.reference = $1
+	`, ref).Scan(&entryCount); err != nil {
+		t.Fatalf("count entries: %v", err)
+	}
+	if entryCount != 2 {
+		t.Fatalf("entries for reference %q = %d, want exactly 2 (from the first, successful Transfer only)", ref, entryCount)
+	}
+
+	got, err := l.Balance(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("Balance(a): %v", err)
+	}
+	if got != -50 {
+		t.Fatalf("balance a = %d, want -50 (only the first transfer should have applied)", got)
+	}
+}
