@@ -1,0 +1,92 @@
+package webhook
+
+import (
+	"bytes"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+type fakeVerifier struct {
+	err     error
+	gotBody []byte
+}
+
+func (v *fakeVerifier) Verify(rawBody []byte, _ http.Header) error {
+	v.gotBody = rawBody
+	return v.err
+}
+
+func TestMiddlewareValidRequestPassesThroughWithBodyIntact(t *testing.T) {
+	verifier := &fakeVerifier{}
+	body := []byte(`{"event":"payment.success"}`)
+
+	var handlerSawBody []byte
+	called := false
+	handler := Middleware(verifier)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("handler: reading body: %v", err)
+		}
+		handlerSawBody = b
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if !called {
+		t.Fatal("handler was not called")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if string(verifier.gotBody) != string(body) {
+		t.Fatalf("Verify saw body %q, want %q", verifier.gotBody, body)
+	}
+	if string(handlerSawBody) != string(body) {
+		t.Fatalf("handler saw body %q, want %q (body must be restored after Verify reads it)", handlerSawBody, body)
+	}
+}
+
+func TestMiddlewareInvalidRequestRejectsWithoutCallingHandler(t *testing.T) {
+	verifier := &fakeVerifier{err: ErrInvalidSignature}
+	called := false
+	handler := Middleware(verifier)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader([]byte("body")))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if called {
+		t.Fatal("handler should not be invoked when verification fails")
+	}
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
+func TestConstantTimeEqual(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b []byte
+		want bool
+	}{
+		{"equal same length", []byte("abc123"), []byte("abc123"), true},
+		{"unequal same length", []byte("abc123"), []byte("abc124"), false},
+		{"unequal different length", []byte("abc"), []byte("abcd"), false},
+		{"both empty", []byte{}, []byte{}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := constantTimeEqual(tt.a, tt.b); got != tt.want {
+				t.Fatalf("constantTimeEqual(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.want)
+			}
+		})
+	}
+}
