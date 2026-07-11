@@ -1,0 +1,136 @@
+package webhook
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+)
+
+type nombaVerifier struct {
+	secret string
+}
+
+// nombaPayload extracts only the fields Nomba's signing string uses.
+// Fields absent from a given webhook (e.g. a payload with no transaction
+// object) decode to their zero value "", matching how Nomba's own sample
+// code treats optional fields.
+type nombaPayload struct {
+	EventType string `json:"event_type"`
+	RequestID string `json:"requestId"`
+	Data      struct {
+		Merchant struct {
+			UserID   string `json:"userId"`
+			WalletID string `json:"walletId"`
+		} `json:"merchant"`
+		Transaction struct {
+			TransactionID string `json:"transactionId"`
+			Type          string `json:"type"`
+			Time          string `json:"time"`
+			ResponseCode  string `json:"responseCode"`
+		} `json:"transaction"`
+	} `json:"data"`
+}
+
+// ProviderNomba returns a Verifier for Nomba's nomba-signature scheme,
+// confirmed against developer.nomba.com/docs/api-basics/webhook and
+// developer.nomba.com/products/webhooks/signature-verification-new. The
+// signing string is nine colon-joined fields:
+//
+//	event_type:requestId:userId:walletId:transactionId:type:time:responseCode:timestamp
+//
+// The first eight come from the JSON payload — event_type and requestId at
+// the root, userId/walletId from data.merchant, and
+// transactionId/type/time/responseCode from data.transaction. The last is
+// the raw nomba-timestamp header value, used exactly as received. The
+// result is HMAC-SHA256 with secret, base64-encoded, compared against the
+// nomba-signature header.
+//
+// Replay protection (rejecting a stale nomba-timestamp) is deliberately
+// NOT implemented here. Nomba's signing string includes a timestamp, but
+// its documentation describes no tolerance window or server-side
+// freshness check for it, and that omission was not independently
+// confirmed against a real production Nomba integration at implementation
+// time. Treat the lack of a staleness check as a known, deliberate gap —
+// confirm against real traffic or updated documentation before relying on
+// timestamp freshness for this provider, the way Stripe's tolerance check
+// can be relied on.
+func ProviderNomba(secret string) Verifier {
+	return &nombaVerifier{secret: secret}
+}
+
+func (v *nombaVerifier) Verify(rawBody []byte, headers http.Header) error {
+	signature := headers.Get("nomba-signature")
+	if signature == "" {
+		return ErrMissingHeader
+	}
+
+	// The timestamp is part of the signing string, not an optional extra —
+	// without it there is nothing to join into position nine.
+	timestamp := headers.Get("nomba-timestamp")
+	if timestamp == "" {
+		return ErrMissingHeader
+	}
+
+	// Nomba's docs don't guarantee every integration surfaces this header,
+	// so its absence is fine. But if it's present and names an algorithm
+	// this file doesn't implement, proceeding would silently verify
+	// against the wrong scheme instead of failing loudly — this is what
+	// notices Nomba rotating algorithms in the future.
+	if alg := headers.Get("nomba-signature-algorithm"); alg != "" && alg != "HmacSHA256" {
+		return ErrUnsupportedAlgorithm
+	}
+
+	var payload nombaPayload
+	if err := json.Unmarshal(rawBody, &payload); err != nil {
+		return fmt.Errorf("webhook: nomba: parsing payload: %w", err)
+	}
+
+	responseCode := payload.Data.Transaction.ResponseCode
+	if responseCode == "null" {
+		// Confirmed in Nomba's own published sample code, identically
+		// across every language they show (Go, Python, JS, Java, C#,
+		// PHP): the literal four-character string "null" is replaced with
+		// an empty string before signing, not passed through as-is.
+		responseCode = ""
+	}
+
+	signingString := strings.Join([]string{
+		payload.EventType,
+		payload.RequestID,
+		payload.Data.Merchant.UserID,
+		payload.Data.Merchant.WalletID,
+		payload.Data.Transaction.TransactionID,
+		payload.Data.Transaction.Type,
+		payload.Data.Transaction.Time,
+		responseCode,
+		timestamp,
+	}, ":")
+
+	mac := hmac.New(sha256.New, []byte(v.secret))
+	mac.Write([]byte(signingString))
+	expected := mac.Sum(nil)
+
+	// A malformed (non-base64) header is a different problem than a
+	// correctly-formed but wrong signature, so it gets its own error
+	// rather than falling through to a signature mismatch.
+	received, err := base64.StdEncoding.DecodeString(signature)
+	if err != nil {
+		return ErrMalformedHeader
+	}
+
+	// Nomba's own sample code compares signatures with a case-insensitive
+	// string equality (EqualFold) on the encoded text, which is looser
+	// than necessary and not constant-time. Decoding the received
+	// signature to raw bytes and comparing those bytes in constant time is
+	// strictly correct: it accepts exactly the signatures real Nomba
+	// traffic produces, without inheriting the sample code's imprecision
+	// or its timing-safety gap.
+	if !constantTimeEqual(expected, received) {
+		return ErrInvalidSignature
+	}
+	return nil
+}

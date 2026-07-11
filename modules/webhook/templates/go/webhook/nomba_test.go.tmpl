@@ -1,0 +1,203 @@
+package webhook
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+	"testing"
+)
+
+// These constants are Nomba's own official documented test vector. If the
+// implementation produces this exact signature for this exact payload, the
+// field mapping, field order, and encoding are all correct simultaneously.
+const (
+	nombaGoldenSecret    = "HkatexKDZg7CLWy96q5sfrVHSvtoz92B"
+	nombaGoldenTimestamp = "2025-09-29T10:51:44Z"
+	nombaGoldenSignature = "Kt9095hQxfgmVbx6iz7G2tPhHdbdXgLlyY/mf35sptw="
+)
+
+// nombaGoldenPayload builds the official documentation sample payload as
+// raw JSON. mutate, if non-nil, tweaks the decoded structure before
+// marshaling, so tests can change one field without repeating the whole
+// payload at every call site.
+func nombaGoldenPayload(mutate func(m map[string]any)) []byte {
+	payload := map[string]any{
+		"event_type": "payment_success",
+		"requestId":  "45f2dc2d-d559-4773-bba3-2d5ec17b2e20",
+		"data": map[string]any{
+			"merchant": map[string]any{
+				"userId":   "b7b10e81-e57d-41d0-8fdc-f4e23a132bbf",
+				"walletId": "6756ff80aafe04a795f18b38",
+			},
+			"transaction": map[string]any{
+				"transactionId": "API-VACT_TRA-B7B10-0435b274-807a-4bc7-8abe-9dbb4548fd7a",
+				"type":          "vact_transfer",
+				"time":          "2025-09-29T10:51:44Z",
+				"responseCode":  "",
+				"amount":        50000,
+				"currency":      "NGN",
+			},
+			"customer": map[string]any{
+				"narration": "Wallet funding",
+			},
+		},
+	}
+	if mutate != nil {
+		mutate(payload)
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		panic(err) // test data construction, not a real failure path
+	}
+	return body
+}
+
+func nombaHeaders(signature, timestamp string) http.Header {
+	h := make(http.Header)
+	h.Set("nomba-signature", signature)
+	h.Set("nomba-timestamp", timestamp)
+	return h
+}
+
+func TestProviderNombaGoldenVectorVerifies(t *testing.T) {
+	v := ProviderNomba(nombaGoldenSecret)
+	body := nombaGoldenPayload(nil)
+	headers := nombaHeaders(nombaGoldenSignature, nombaGoldenTimestamp)
+
+	if err := v.Verify(body, headers); err != nil {
+		t.Fatalf("Verify() = %v, want nil for Nomba's official documented test vector", err)
+	}
+}
+
+func TestProviderNombaTamperedSigningFieldRejected(t *testing.T) {
+	// transactionId is one of the eight fields the signature covers, so
+	// changing it must invalidate the golden signature.
+	body := nombaGoldenPayload(func(m map[string]any) {
+		txn := m["data"].(map[string]any)["transaction"].(map[string]any)
+		txn["transactionId"] = "API-VACT_TRA-B7B10-tampered"
+	})
+
+	v := ProviderNomba(nombaGoldenSecret)
+	err := v.Verify(body, nombaHeaders(nombaGoldenSignature, nombaGoldenTimestamp))
+	if !errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("Verify() error = %v, want ErrInvalidSignature after changing a field the signature covers", err)
+	}
+}
+
+func TestProviderNombaTamperedNonSigningFieldStillVerifies(t *testing.T) {
+	// Nomba signs eight extracted fields, not the raw body as a whole —
+	// unlike Stripe, Paystack, and Flutterwave above. A change anywhere
+	// else in the JSON, like this narration field, does not touch the
+	// signing string at all. This documents the actual scope of what this
+	// scheme protects: it is not a whole-body integrity check, and a
+	// change outside the eight mapped fields is invisible to it by design.
+	body := nombaGoldenPayload(func(m map[string]any) {
+		customer := m["data"].(map[string]any)["customer"].(map[string]any)
+		customer["narration"] = "this field is not part of the signature"
+	})
+
+	v := ProviderNomba(nombaGoldenSecret)
+	if err := v.Verify(body, nombaHeaders(nombaGoldenSignature, nombaGoldenTimestamp)); err != nil {
+		t.Fatalf("Verify() = %v, want nil — narration is not part of the signing set", err)
+	}
+}
+
+func TestProviderNombaResponseCodeNullStringSubstituted(t *testing.T) {
+	// The golden signature was computed with responseCode "". If the
+	// "null" -> "" substitution is actually implemented, a payload with
+	// the literal string "null" must verify against that same signature —
+	// not a different one.
+	body := nombaGoldenPayload(func(m map[string]any) {
+		txn := m["data"].(map[string]any)["transaction"].(map[string]any)
+		txn["responseCode"] = "null"
+	})
+
+	v := ProviderNomba(nombaGoldenSecret)
+	if err := v.Verify(body, nombaHeaders(nombaGoldenSignature, nombaGoldenTimestamp)); err != nil {
+		t.Fatalf(`Verify() = %v, want nil — a literal "null" responseCode must substitute to an empty string`, err)
+	}
+}
+
+func TestProviderNombaMissingSignatureHeader(t *testing.T) {
+	v := ProviderNomba(nombaGoldenSecret)
+	h := make(http.Header)
+	h.Set("nomba-timestamp", nombaGoldenTimestamp)
+
+	err := v.Verify(nombaGoldenPayload(nil), h)
+	if !errors.Is(err, ErrMissingHeader) {
+		t.Fatalf("Verify() error = %v, want ErrMissingHeader", err)
+	}
+}
+
+func TestProviderNombaMissingTimestampHeader(t *testing.T) {
+	v := ProviderNomba(nombaGoldenSecret)
+	h := make(http.Header)
+	h.Set("nomba-signature", nombaGoldenSignature)
+
+	err := v.Verify(nombaGoldenPayload(nil), h)
+	if !errors.Is(err, ErrMissingHeader) {
+		t.Fatalf("Verify() error = %v, want ErrMissingHeader", err)
+	}
+}
+
+func TestProviderNombaUnsupportedAlgorithmRejected(t *testing.T) {
+	v := ProviderNomba(nombaGoldenSecret)
+	h := nombaHeaders(nombaGoldenSignature, nombaGoldenTimestamp)
+	h.Set("nomba-signature-algorithm", "HmacSHA512")
+
+	err := v.Verify(nombaGoldenPayload(nil), h)
+	if !errors.Is(err, ErrUnsupportedAlgorithm) {
+		t.Fatalf("Verify() error = %v, want ErrUnsupportedAlgorithm", err)
+	}
+}
+
+func TestProviderNombaAlgorithmHeaderAbsentStillVerifies(t *testing.T) {
+	v := ProviderNomba(nombaGoldenSecret)
+	h := nombaHeaders(nombaGoldenSignature, nombaGoldenTimestamp)
+	// nomba-signature-algorithm deliberately not set.
+
+	if err := v.Verify(nombaGoldenPayload(nil), h); err != nil {
+		t.Fatalf("Verify() = %v, want nil when nomba-signature-algorithm is absent", err)
+	}
+}
+
+func TestProviderNombaCorrectAlgorithmHeaderStillVerifies(t *testing.T) {
+	v := ProviderNomba(nombaGoldenSecret)
+	h := nombaHeaders(nombaGoldenSignature, nombaGoldenTimestamp)
+	h.Set("nomba-signature-algorithm", "HmacSHA256")
+
+	if err := v.Verify(nombaGoldenPayload(nil), h); err != nil {
+		t.Fatalf("Verify() = %v, want nil when nomba-signature-algorithm matches", err)
+	}
+}
+
+func TestProviderNombaMalformedSignatureHeaderRejected(t *testing.T) {
+	v := ProviderNomba(nombaGoldenSecret)
+
+	err := v.Verify(nombaGoldenPayload(nil), nombaHeaders("not-valid-base64!!!", nombaGoldenTimestamp))
+	if !errors.Is(err, ErrMalformedHeader) {
+		t.Fatalf("Verify() error = %v, want ErrMalformedHeader", err)
+	}
+}
+
+func TestProviderNombaMalformedJSONBodyReturnsDistinctError(t *testing.T) {
+	v := ProviderNomba(nombaGoldenSecret)
+	body := []byte(`{not valid json`)
+
+	err := v.Verify(body, nombaHeaders(nombaGoldenSignature, nombaGoldenTimestamp))
+	if err == nil {
+		t.Fatal("Verify() error = nil, want a parse error for malformed JSON")
+	}
+	if errors.Is(err, ErrInvalidSignature) {
+		t.Fatal("Verify() reported malformed JSON as a signature mismatch — these are different failure modes and must be distinguishable")
+	}
+}
+
+func TestProviderNombaWrongSecretRejected(t *testing.T) {
+	v := ProviderNomba("wrong-secret")
+
+	err := v.Verify(nombaGoldenPayload(nil), nombaHeaders(nombaGoldenSignature, nombaGoldenTimestamp))
+	if !errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("Verify() error = %v, want ErrInvalidSignature", err)
+	}
+}
