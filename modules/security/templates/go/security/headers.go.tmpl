@@ -1,0 +1,62 @@
+// Package security provides transport-layer HTTP hardening: response
+// headers, CORS, request body limits, server timeouts, Host validation,
+// and an HTTPS redirect — each independent, each inactive until the
+// generated project actually wires it into its handler chain.
+package security
+
+import "net/http"
+
+// DefaultHeaders returns middleware setting response headers that are safe
+// to enable unconditionally, for every project, with no configuration.
+func DefaultHeaders() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			h := w.Header()
+			// includeSubDomains but no preload: submitting to the browser
+			// preload list is a one-way, hard-to-reverse decision that
+			// affects every subdomain forever, and it requires the
+			// project owner to actually submit the domain themselves. A
+			// generated project should never be auto-enrolled in that
+			// without an informed, deliberate choice.
+			h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+			h.Set("X-Content-Type-Options", "nosniff")
+			h.Set("X-Frame-Options", "DENY")
+			h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+			// Conservative default: disable browser features irrelevant
+			// to a typical fintech API or admin backend. A project that
+			// actually needs one of these can override it explicitly.
+			h.Set("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+
+			// X-XSS-Protection is deliberately not set. It's deprecated
+			// in current browser security guidance: modern browsers
+			// ignore it, and in some older ones enabling it has
+			// introduced its own XSS vulnerabilities via its filter
+			// heuristics. Current best practice is to omit the header
+			// entirely (or send "0" to explicitly disable the legacy
+			// filter) — not to turn it on. This is a documented omission,
+			// the same posture as the webhook module's decision not to
+			// implement Flutterwave's deprecated verif-hash scheme.
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// WithCSP adds a Content-Security-Policy header with exactly the policy
+// string given. It's not part of DefaultHeaders: CSP is
+// application-specific — it depends on which CDNs, inline scripts,
+// analytics, and payment widgets a project actually uses — and a wrong
+// default CSP breaks applications rather than securing them. This module
+// never guesses one on the caller's behalf.
+//
+// Compose it with DefaultHeaders() through ordinary middleware chaining;
+// there's no combined options struct, because both are independent
+// func(http.Handler) http.Handler values a caller chains explicitly.
+func WithCSP(policy string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Security-Policy", policy)
+			next.ServeHTTP(w, r)
+		})
+	}
+}

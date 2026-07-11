@@ -1,0 +1,32 @@
+apiVersion: keel/v1
+name: security
+version: 0.1.0
+summary: "Transport-layer HTTP security hardening: headers, CORS, body limits, server timeouts, host validation, HTTPS redirect."
+tags: [security, reliability]
+
+requires: []
+conflicts: []
+
+languages:
+  go:
+    templates:
+      - from: templates/go/security/headers.go.tmpl
+        to: internal/security/headers.go
+      - from: templates/go/security/cors.go.tmpl
+        to: internal/security/cors.go
+      - from: templates/go/security/server.go.tmpl
+        to: internal/security/server.go
+      - from: templates/go/security/hosts.go.tmpl
+        to: internal/security/hosts.go
+      - from: templates/go/security/https_redirect.go.tmpl
+        to: internal/security/https_redirect.go
+      - from: templates/go/security/headers_test.go.tmpl
+        to: internal/security/headers_test.go
+      - from: templates/go/security/cors_test.go.tmpl
+        to: internal/security/cors_test.go
+      - from: templates/go/security/server_test.go.tmpl
+        to: internal/security/server_test.go
+      - from: templates/go/security/hosts_test.go.tmpl
+        to: internal/security/hosts_test.go
+      - from: templates/go/security/https_redirect_test.go.tmpl
+        to: internal/security/https_redirect_test.go
