@@ -1,0 +1,36 @@
+package security
+
+import (
+	"net/http"
+	"strings"
+)
+
+// ValidateHost returns middleware rejecting requests whose Host header
+// isn't in allowed, with 400. This guards against Host header injection —
+// e.g. a poisoned Host used to build a password-reset link, or cache
+// poisoning behind a proxy that trusts whatever Host a client sends.
+//
+// Same inactive-until-configured posture as CORS: a generated project
+// that never wires this in has no host-validation behavior, by omission —
+// there's no separate enabled/disabled flag to forget to set.
+//
+// Host headers are compared case-insensitively here, matching the
+// convention for hostnames (DNS names have no case, and proxies and
+// clients vary in how they case a Host header). This normalization is
+// deliberate, not an oversight.
+func ValidateHost(allowed ...string) func(http.Handler) http.Handler {
+	allowedSet := make(map[string]bool, len(allowed))
+	for _, h := range allowed {
+		allowedSet[strings.ToLower(h)] = true
+	}
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !allowedSet[strings.ToLower(r.Host)] {
+				http.Error(w, "invalid host", http.StatusBadRequest)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}

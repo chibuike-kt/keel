@@ -1,0 +1,42 @@
+package security
+
+import "net/http"
+
+// RedirectHTTPS returns middleware redirecting http:// requests to
+// https://.
+//
+// In most real deployments, TLS termination happens at a reverse proxy or
+// load balancer (nginx, Cloudflare, an ALB) in front of the Go process,
+// which means the process itself only ever sees plaintext HTTP — r.TLS is
+// always nil from its point of view. Applying this middleware with
+// trustProxyHeader false in that setup redirects every single request,
+// forever, since it never sees a request it considers already secure:
+// a redirect loop, not a security improvement.
+//
+// trustProxyHeader, when true, checks X-Forwarded-Proto instead of r.TLS
+// to determine the original scheme. Only set this true when you control
+// and trust whatever sets that header — X-Forwarded-Proto is an ordinary
+// request header, trivially spoofable by any client that talks to the Go
+// process directly, bypassing your proxy. Setting trustProxyHeader true
+// behind a proxy that doesn't strip and re-set this header itself is a
+// security hole; setting it false in front of a proxy that terminates TLS
+// is a redirect loop. This is the single easiest thing in this module to
+// misconfigure — read both sides of that trade-off before flipping it.
+func RedirectHTTPS(trustProxyHeader bool) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			secure := r.TLS != nil
+			if trustProxyHeader {
+				secure = r.Header.Get("X-Forwarded-Proto") == "https"
+			}
+
+			if !secure {
+				target := "https://" + r.Host + r.URL.RequestURI()
+				http.Redirect(w, r, target, http.StatusMovedPermanently)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}

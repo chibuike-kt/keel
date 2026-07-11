@@ -1,0 +1,94 @@
+package security
+
+import (
+	"crypto/tls"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestRedirectHTTPSPlainRequestRedirectsBasedOnTLS(t *testing.T) {
+	called := false
+	handler := RedirectHTTPS(false)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/path", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if called {
+		t.Fatal("handler should not be invoked for a plain HTTP request")
+	}
+	if rec.Code != http.StatusMovedPermanently {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusMovedPermanently)
+	}
+	if got := rec.Header().Get("Location"); got != "https://example.com/path" {
+		t.Fatalf("Location = %q, want %q", got, "https://example.com/path")
+	}
+}
+
+func TestRedirectHTTPSTLSRequestPassesThrough(t *testing.T) {
+	called := false
+	handler := RedirectHTTPS(false)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "https://example.com/path", nil)
+	req.TLS = &tls.ConnectionState{}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if !called {
+		t.Fatal("handler should be invoked when r.TLS is set")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+}
+
+func TestRedirectHTTPSTrustProxyHeaderChecksForwardedProtoNotTLS(t *testing.T) {
+	// With trustProxyHeader true, X-Forwarded-Proto decides, not r.TLS —
+	// even a request with r.TLS set must still redirect if the (trusted)
+	// proxy says the original request was plain HTTP.
+	called := false
+	handler := RedirectHTTPS(true)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/path", nil)
+	req.TLS = &tls.ConnectionState{} // deliberately set, must be ignored
+	req.Header.Set("X-Forwarded-Proto", "http")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if called {
+		t.Fatal("handler should not be invoked when X-Forwarded-Proto is http, regardless of r.TLS")
+	}
+	if rec.Code != http.StatusMovedPermanently {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusMovedPermanently)
+	}
+}
+
+func TestRedirectHTTPSTrustProxyHeaderHTTPSPassesThrough(t *testing.T) {
+	called := false
+	handler := RedirectHTTPS(true)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/path", nil)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	// r.TLS deliberately left nil — trustProxyHeader must rely on the
+	// header, not r.TLS, so this must still pass through.
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if !called {
+		t.Fatal("handler should be invoked when X-Forwarded-Proto is https, regardless of r.TLS")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+}
