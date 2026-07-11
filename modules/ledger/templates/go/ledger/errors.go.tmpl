@@ -1,0 +1,75 @@
+package ledger
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+var (
+	// ErrInsufficientFunds is returned when posting a transaction would
+	// take an account below zero and that account does not allow
+	// overdraft.
+	ErrInsufficientFunds = errors.New("ledger: insufficient funds")
+	// ErrUnbalancedTransaction is returned when a transaction's entries do
+	// not sum to zero. Post's own Validate call catches this before any
+	// database round trip; this only surfaces if the database's deferred
+	// constraint trigger catches something Go's pre-check didn't (e.g. a
+	// bypass of Post entirely).
+	ErrUnbalancedTransaction = errors.New("ledger: transaction does not balance to zero")
+	// ErrCurrencyMismatch is returned when a transaction's entries touch
+	// accounts in more than one currency.
+	ErrCurrencyMismatch = errors.New("ledger: transaction spans more than one currency")
+	// ErrDuplicateReference is returned when a transaction's Reference has
+	// already been posted.
+	ErrDuplicateReference = errors.New("ledger: transaction reference already exists")
+	// ErrAccountNotFound is returned when a transaction references an
+	// account that does not exist.
+	ErrAccountNotFound = errors.New("ledger: account not found")
+)
+
+// Postgres SQLSTATEs raised by migrations/0001_ledger_schema.sql's trigger
+// functions. They're in Postgres's user-defined range, chosen so Go can
+// distinguish which invariant fired without matching on error message
+// text.
+const (
+	pgCodeUnbalancedTransaction = "LG002"
+	pgCodeCurrencyMismatch      = "LG003"
+	pgCodeOverdraftNotAllowed   = "LG004"
+)
+
+const (
+	pgConstraintTransactionsReference = "transactions_reference_key"
+	pgConstraintEntriesAccountFK      = "entries_account_id_fkey"
+)
+
+// mapPgError translates a Postgres error raised by the ledger schema's
+// constraints and triggers into a typed ledger error, so callers never
+// need to inspect a raw pgconn.PgError themselves. Errors it doesn't
+// recognize are wrapped, not swallowed.
+func mapPgError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return fmt.Errorf("ledger: %w", err)
+	}
+
+	switch {
+	case pgErr.Code == pgCodeUnbalancedTransaction:
+		return ErrUnbalancedTransaction
+	case pgErr.Code == pgCodeCurrencyMismatch:
+		return ErrCurrencyMismatch
+	case pgErr.Code == pgCodeOverdraftNotAllowed:
+		return ErrInsufficientFunds
+	case pgErr.Code == "23505" && pgErr.ConstraintName == pgConstraintTransactionsReference:
+		return ErrDuplicateReference
+	case pgErr.Code == "23503" && pgErr.ConstraintName == pgConstraintEntriesAccountFK:
+		return ErrAccountNotFound
+	default:
+		return fmt.Errorf("ledger: %w", err)
+	}
+}

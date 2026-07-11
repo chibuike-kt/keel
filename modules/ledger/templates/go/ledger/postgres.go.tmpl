@@ -1,0 +1,200 @@
+package ledger
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Ledger is a Postgres-backed double-entry ledger. See
+// migrations/0001_ledger_schema.sql for the schema and the invariants the
+// database itself enforces.
+type Ledger struct {
+	pool *pgxpool.Pool
+}
+
+// New returns a Ledger backed by pool.
+func New(pool *pgxpool.Pool) *Ledger {
+	return &Ledger{pool: pool}
+}
+
+// CreateAccount inserts a new account and returns it.
+func (l *Ledger) CreateAccount(ctx context.Context, externalRef, currency string, allowOverdraft bool) (Account, error) {
+	const query = `
+		INSERT INTO accounts (external_ref, currency, allow_overdraft)
+		VALUES ($1, $2, $3)
+		RETURNING id, external_ref, currency, balance, allow_overdraft, created_at
+	`
+
+	var a Account
+	err := l.pool.QueryRow(ctx, query, externalRef, currency, allowOverdraft).Scan(
+		&a.ID, &a.ExternalRef, &a.Currency, &a.Balance, &a.AllowOverdraft, &a.CreatedAt,
+	)
+	if err != nil {
+		return Account{}, mapPgError(err)
+	}
+	return a, nil
+}
+
+// Post commits txn atomically: either every entry is written and every
+// touched account's balance updated, or none of it is.
+func (l *Ledger) Post(ctx context.Context, txn Transaction) error {
+	if err := txn.Validate(); err != nil {
+		return err
+	}
+
+	tx, err := l.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("ledger: begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx) // no-op once Commit succeeds
+
+	accountIDs := distinctSortedAccountIDs(txn.Entries)
+
+	// Lock every touched account, in a single deterministic order (sorted
+	// ascending by ID), before reading or writing any of them. This is the
+	// single most important line in this function, and the easiest thing
+	// for a future editor to "simplify" away without understanding why
+	// it's here: two concurrent transfers between the same two accounts
+	// in opposite directions (A->B and B->A) each need both accounts'
+	// locks. Without a fixed acquisition order, one transfer can lock A
+	// and wait for B while the other locks B and waits for A — each
+	// holding what the other needs, forever. Sorting first means every
+	// concurrent Post call requests locks in the same order, so they
+	// queue instead of deadlocking.
+	accounts := make(map[int64]Account, len(accountIDs))
+	const lockQuery = `
+		SELECT id, external_ref, currency, balance, allow_overdraft, created_at
+		FROM accounts
+		WHERE id = $1
+		FOR UPDATE
+	`
+	for _, id := range accountIDs {
+		var a Account
+		err := tx.QueryRow(ctx, lockQuery, id).Scan(
+			&a.ID, &a.ExternalRef, &a.Currency, &a.Balance, &a.AllowOverdraft, &a.CreatedAt,
+		)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrAccountNotFound
+			}
+			return mapPgError(err)
+		}
+		accounts[id] = a
+	}
+
+	// Net delta per account from this transaction's entries.
+	deltas := make(map[int64]int64, len(accountIDs))
+	for _, e := range txn.Entries {
+		deltas[e.AccountID] += e.Amount
+	}
+
+	// Fast, friendly pre-check: for every account that doesn't allow
+	// overdraft, refuse before writing anything if the resulting balance
+	// would go negative. The database trigger (invariant 4 in the schema)
+	// is the real enforcement — this just gives the caller a clean
+	// ErrInsufficientFunds instead of a raw Postgres error, and avoids
+	// writing rows that would only be rolled back anyway.
+	for _, id := range accountIDs {
+		a := accounts[id]
+		if !a.AllowOverdraft && a.Balance+deltas[id] < 0 {
+			return ErrInsufficientFunds
+		}
+	}
+
+	var txnID int64
+	const insertTxn = `INSERT INTO transactions (reference, description) VALUES ($1, $2) RETURNING id`
+	if err := tx.QueryRow(ctx, insertTxn, txn.Reference, txn.Description).Scan(&txnID); err != nil {
+		return mapPgError(err)
+	}
+
+	const insertEntry = `INSERT INTO entries (transaction_id, account_id, amount) VALUES ($1, $2, $3)`
+	for _, e := range txn.Entries {
+		if _, err := tx.Exec(ctx, insertEntry, txnID, e.AccountID, e.Amount); err != nil {
+			return mapPgError(err)
+		}
+	}
+
+	const updateBalance = `UPDATE accounts SET balance = balance + $2 WHERE id = $1`
+	for _, id := range accountIDs {
+		if _, err := tx.Exec(ctx, updateBalance, id, deltas[id]); err != nil {
+			return mapPgError(err)
+		}
+	}
+
+	// The deferred constraint triggers — balance-to-zero and
+	// single-currency — actually run here, at commit, not at any of the
+	// inserts above. Map whatever they (or anything else in this
+	// transaction) raise to a typed error rather than leaking a raw
+	// pgconn error to the caller.
+	if err := tx.Commit(ctx); err != nil {
+		return mapPgError(err)
+	}
+	return nil
+}
+
+// Transfer is a convenience wrapper around Post for the common two-account
+// case.
+func (l *Ledger) Transfer(ctx context.Context, from, to int64, amount int64, reference string) error {
+	return l.Post(ctx, Transaction{
+		Reference: reference,
+		Entries:   []Entry{Debit(from, amount), Credit(to, amount)},
+	})
+}
+
+// Balance reads accounts.balance directly — the cached projection — rather
+// than summing entries. This is intentionally the fast path; see
+// VerifyBalance to check the projection against the underlying entries.
+func (l *Ledger) Balance(ctx context.Context, accountID int64) (int64, error) {
+	const query = `SELECT balance FROM accounts WHERE id = $1`
+
+	var balance int64
+	if err := l.pool.QueryRow(ctx, query, accountID).Scan(&balance); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrAccountNotFound
+		}
+		return 0, mapPgError(err)
+	}
+	return balance, nil
+}
+
+// VerifyBalance reads accounts.balance (cached) and independently computes
+// SUM(entries.amount) (computed) for accountID in the same call, so a
+// caller — or a test, or future reconciliation tooling — can assert they
+// match. This is the callable implementation of "you can always verify the
+// cached balance," not just a comment claiming it's possible.
+func (l *Ledger) VerifyBalance(ctx context.Context, accountID int64) (cached, computed int64, err error) {
+	const query = `
+		SELECT
+			a.balance,
+			COALESCE((SELECT SUM(e.amount) FROM entries e WHERE e.account_id = a.id), 0)
+		FROM accounts a
+		WHERE a.id = $1
+	`
+
+	if err := l.pool.QueryRow(ctx, query, accountID).Scan(&cached, &computed); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, 0, ErrAccountNotFound
+		}
+		return 0, 0, mapPgError(err)
+	}
+	return cached, computed, nil
+}
+
+func distinctSortedAccountIDs(entries []Entry) []int64 {
+	seen := make(map[int64]bool, len(entries))
+	ids := make([]int64, 0, len(entries))
+	for _, e := range entries {
+		if seen[e.AccountID] {
+			continue
+		}
+		seen[e.AccountID] = true
+		ids = append(ids, e.AccountID)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
