@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"fmt"
 
 	"github.com/chibuike-kt/keel/internal/resolver"
 )
@@ -58,10 +59,17 @@ func (r *Renderer) Render(plan *resolver.Plan, ctx Context, targetDir string) er
 		return err
 	}
 
-	renameFailed := false
+renameFailed := false
 	defer func() {
-		if !renameFailed {
-			os.RemoveAll(stagingDir)
+		if renameFailed {
+			return
+		}
+		if err := os.RemoveAll(stagingDir); err != nil {
+			// Best-effort cleanup after an already-failed render. There's no
+			// error return path from a defer, so this can't be folded into
+			// Render's own error — log it so a leaked staging directory is
+			// at least visible instead of silently discarded.
+			fmt.Fprintf(os.Stderr, "keel: warning: failed to remove staging directory %s: %v\n", stagingDir, err)
 		}
 	}()
 

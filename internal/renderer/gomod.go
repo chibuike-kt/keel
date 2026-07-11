@@ -30,5 +30,5 @@ func writeGoMod(stagingDir string, ctx Context, deps []dependency) error {
 		b.WriteString(")\n")
 	}
 
-	return os.WriteFile(filepath.Join(stagingDir, "go.mod"), []byte(b.String()), 0o644)
+	return os.WriteFile(filepath.Join(stagingDir, "go.mod"), []byte(b.String()), 0o644) //nolint:gosec // go.mod is ordinary project source, not sensitive
 }
