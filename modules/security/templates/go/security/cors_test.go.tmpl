@@ -1,0 +1,168 @@
+package security
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestNewRejectsWildcardWithCredentials(t *testing.T) {
+	middleware, err := New(WithOrigins("*"), WithCredentials())
+	if err == nil {
+		t.Fatal("New() error = nil, want an error for wildcard origin + credentials")
+	}
+	if middleware != nil {
+		t.Fatal("New() middleware != nil, want no middleware constructed on error")
+	}
+}
+
+func TestNewValidOriginAllowedSimpleRequest(t *testing.T) {
+	middleware, err := New(WithOrigins("https://app.example.com"))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	called := false
+	handler := middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if !called {
+		t.Fatal("handler was not called")
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want %q", got, "https://app.example.com")
+	}
+	if got := rec.Header().Get("Vary"); got != "Origin" {
+		t.Fatalf("Vary = %q, want %q", got, "Origin")
+	}
+}
+
+func TestNewValidOriginPreflight(t *testing.T) {
+	middleware, err := New(WithOrigins("https://app.example.com"))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	called := false
+	handler := middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+
+	req := httptest.NewRequest(http.MethodOptions, "/", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if called {
+		t.Fatal("a preflight OPTIONS request should not be forwarded to next")
+	}
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want %q", got, "https://app.example.com")
+	}
+	if rec.Header().Get("Access-Control-Allow-Methods") == "" {
+		t.Fatal("Access-Control-Allow-Methods not set on preflight response")
+	}
+	if rec.Header().Get("Access-Control-Allow-Headers") == "" {
+		t.Fatal("Access-Control-Allow-Headers not set on preflight response")
+	}
+}
+
+func TestNewOriginNotInAllowlistStillReachesHandler(t *testing.T) {
+	// CORS is enforced by the browser, not by the server refusing the
+	// request: a simple request from a disallowed origin gets no CORS
+	// headers (so the browser withholds the response from script), but
+	// the server must still run the handler — blocking it here would be
+	// this middleware overstepping its actual job.
+	middleware, err := New(WithOrigins("https://app.example.com"))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	called := false
+	handler := middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Origin", "https://evil.example.com")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if !called {
+		t.Fatal("handler should still be invoked for a disallowed origin on a simple request")
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want empty for a disallowed origin", got)
+	}
+}
+
+func TestNewDefaultMethodsAndHeadersUsedWhenUnset(t *testing.T) {
+	middleware, err := New(WithOrigins("https://app.example.com"))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	handler := middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	req := httptest.NewRequest(http.MethodOptions, "/", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	wantMethods := "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+	if got := rec.Header().Get("Access-Control-Allow-Methods"); got != wantMethods {
+		t.Fatalf("Access-Control-Allow-Methods = %q, want default %q", got, wantMethods)
+	}
+	wantHeaders := "Content-Type, Authorization"
+	if got := rec.Header().Get("Access-Control-Allow-Headers"); got != wantHeaders {
+		t.Fatalf("Access-Control-Allow-Headers = %q, want default %q", got, wantHeaders)
+	}
+}
+
+func TestNewWildcardWithoutCredentialsSetsLiteralWildcard(t *testing.T) {
+	middleware, err := New(WithOrigins("*"))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	handler := middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Origin", "https://anything.example.com")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf(`Access-Control-Allow-Origin = %q, want literal "*"`, got)
+	}
+}
+
+func TestNewCredentialsWithSpecificOriginAllowed(t *testing.T) {
+	middleware, err := New(WithOrigins("https://app.example.com"), WithCredentials())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	handler := middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Fatalf("Access-Control-Allow-Credentials = %q, want %q", got, "true")
+	}
+}
