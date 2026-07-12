@@ -268,3 +268,79 @@ func TestRenderTargetExists(t *testing.T) {
 		t.Fatalf("targetDir entries = %v, want only the pre-existing marker", entries)
 	}
 }
+
+func TestRenderExposesModulesSortedAlphabetically(t *testing.T) {
+	templates := fstest.MapFS{
+		"modules/zebra/templates/go/x.tmpl": &fstest.MapFile{
+			Data: []byte("{{range .Modules}}{{.Name}}:{{.Summary}}\n{{end}}"),
+		},
+	}
+	// plan.Modules is deliberately in non-alphabetical (topological)
+	// order — zebra depends on nothing but is listed before alpha here —
+	// to prove the rendered {{.Modules}} is re-sorted by name, not a
+	// passthrough of plan.Modules' own order.
+	zebra := moduleGo("zebra", manifest.Language{
+		Templates: []manifest.Template{{From: "templates/go/x.tmpl", To: "internal/listing.txt"}},
+	})
+	zebra.Summary = "the last one"
+	alpha := moduleGo("alpha", manifest.Language{})
+	alpha.Summary = "the first one"
+
+	plan := &resolver.Plan{Language: "go", Modules: []*manifest.Manifest{zebra, alpha}}
+	targetDir := filepath.Join(t.TempDir(), "myapp")
+	r := New(templates)
+	ctx := Context{ProjectName: "myapp", ModulePath: "github.com/user/myapp", GoVersion: "1.26"}
+
+	if err := r.Render(plan, ctx, targetDir); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(targetDir, "internal", "listing.txt"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	want := "alpha:the first one\nzebra:the last one\n"
+	if string(got) != want {
+		t.Fatalf("listing.txt = %q, want %q", got, want)
+	}
+}
+
+func TestRenderEnvExampleDeterministicAcrossRepeatedCalls(t *testing.T) {
+	templates := fstest.MapFS{
+		"modules/a/templates/go/x.tmpl": &fstest.MapFile{Data: []byte("package a\n")},
+		"modules/b/templates/go/y.tmpl": &fstest.MapFile{Data: []byte("package b\n")},
+	}
+	moduleA := moduleGo("a", manifest.Language{
+		Templates: []manifest.Template{{From: "templates/go/x.tmpl", To: "internal/a.go"}},
+	})
+	moduleA.EnvVars = []manifest.EnvVar{{Name: "ZOO_URL", Description: "z", Required: true}}
+	moduleB := moduleGo("b", manifest.Language{
+		Templates: []manifest.Template{{From: "templates/go/y.tmpl", To: "internal/b.go"}},
+	})
+	moduleB.EnvVars = []manifest.EnvVar{{Name: "APP_NAME", Description: "a", Required: false, Default: "myapp"}}
+
+	plan := &resolver.Plan{Language: "go", Modules: []*manifest.Manifest{moduleA, moduleB}}
+	r := New(templates)
+	ctx := Context{ProjectName: "myapp", ModulePath: "github.com/user/myapp", GoVersion: "1.26"}
+
+	targetA := filepath.Join(t.TempDir(), "myapp")
+	targetB := filepath.Join(t.TempDir(), "myapp")
+	if err := r.Render(plan, ctx, targetA); err != nil {
+		t.Fatalf("Render (a): %v", err)
+	}
+	if err := r.Render(plan, ctx, targetB); err != nil {
+		t.Fatalf("Render (b): %v", err)
+	}
+
+	a, err := os.ReadFile(filepath.Join(targetA, ".env.example"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(targetB, ".env.example"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(a) != string(b) {
+		t.Fatalf(".env.example not byte-identical across repeated Render calls:\na = %q\nb = %q", a, b)
+	}
+}

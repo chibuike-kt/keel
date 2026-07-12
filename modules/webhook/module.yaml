@@ -7,6 +7,22 @@ tags: [payments, security]
 requires: []
 conflicts: []
 
+# All optional: a project only wires up the providers it actually
+# integrates with, not all four.
+env:
+  - name: STRIPE_WEBHOOK_SECRET
+    description: Stripe webhook signing secret, used to verify Stripe-Signature headers.
+    required: false
+  - name: PAYSTACK_SECRET_KEY
+    description: Paystack secret key, used to verify x-paystack-signature headers.
+    required: false
+  - name: FLUTTERWAVE_SECRET_HASH
+    description: Flutterwave secret hash, used to verify verif-hash headers.
+    required: false
+  - name: NOMBA_SECRET_KEY
+    description: Nomba secret key, used to verify webhook signatures.
+    required: false
+
 languages:
   go:
     templates:

@@ -49,7 +49,7 @@ func (r *Renderer) Render(plan *resolver.Plan, ctx Context, targetDir string) er
 		return err
 	}
 
-	tasks, deps, err := validatePlan(plan)
+	tasks, deps, envVars, err := validatePlan(plan)
 	if err != nil {
 		return err
 	}
@@ -73,13 +73,18 @@ func (r *Renderer) Render(plan *resolver.Plan, ctx Context, targetDir string) er
 		}
 	}()
 
+	modules := moduleInfos(plan)
 	for _, task := range tasks {
-		if err := r.renderTemplate(task, ctx, stagingDir); err != nil {
+		if err := r.renderTemplate(task, ctx, modules, stagingDir); err != nil {
 			return err
 		}
 	}
 
 	if err := writeGoMod(stagingDir, ctx, deps); err != nil {
+		return err
+	}
+
+	if err := writeEnvExample(stagingDir, envVars); err != nil {
 		return err
 	}
 

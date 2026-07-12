@@ -49,6 +49,25 @@ func (e *DependencyConflictError) Error() string {
 		e.Module, e.VersionA, e.ViaA, e.VersionB, e.ViaB)
 }
 
+// EnvVarConflictError reports the same environment variable declared by
+// two modules with different Required or Default settings. Identical
+// declarations (same Required and Default; Description may differ, that's
+// just prose) dedupe silently instead of producing this error.
+type EnvVarConflictError struct {
+	Name      string
+	ModuleA   string
+	RequiredA bool
+	DefaultA  string
+	ModuleB   string
+	RequiredB bool
+	DefaultB  string
+}
+
+func (e *EnvVarConflictError) Error() string {
+	return fmt.Sprintf("env var %q declared differently by %q (required=%t, default=%q) and %q (required=%t, default=%q)",
+		e.Name, e.ModuleA, e.RequiredA, e.DefaultA, e.ModuleB, e.RequiredB, e.DefaultB)
+}
+
 // TemplateError wraps a parse or execution failure for one module's
 // template.
 type TemplateError struct {
@@ -69,6 +88,7 @@ type RenderError struct {
 	PathEscapes          []*PathEscapeError
 	DuplicateOutputPaths []*DuplicateOutputPathError
 	DependencyConflicts  []*DependencyConflictError
+	EnvVarConflicts      []*EnvVarConflictError
 }
 
 func (e *RenderError) Error() string {
@@ -91,6 +111,9 @@ func (e *RenderError) Unwrap() []error {
 	}
 	for _, ce := range e.DependencyConflicts {
 		errs = append(errs, ce)
+	}
+	for _, ee := range e.EnvVarConflicts {
+		errs = append(errs, ee)
 	}
 	return errs
 }

@@ -25,18 +25,20 @@ type dependency struct {
 }
 
 // validatePlan runs pass 1: computing every template's destination and the
-// merged dependency set, aggregating every violation into a *RenderError
-// rather than stopping at the first. It never touches disk.
-func validatePlan(plan *resolver.Plan) ([]renderTask, []dependency, error) {
+// merged dependency and env var sets, aggregating every violation into a
+// *RenderError rather than stopping at the first. It never touches disk.
+func validatePlan(plan *resolver.Plan) ([]renderTask, []dependency, []manifest.EnvVar, error) {
 	var renderErr RenderError
 
 	tasks := collectTasks(plan, &renderErr)
 	deps := collectDependencies(plan, &renderErr)
+	envVars := collectEnvVars(plan, &renderErr)
 
-	if len(renderErr.PathEscapes) > 0 || len(renderErr.DuplicateOutputPaths) > 0 || len(renderErr.DependencyConflicts) > 0 {
-		return nil, nil, &renderErr
+	if len(renderErr.PathEscapes) > 0 || len(renderErr.DuplicateOutputPaths) > 0 ||
+		len(renderErr.DependencyConflicts) > 0 || len(renderErr.EnvVarConflicts) > 0 {
+		return nil, nil, nil, &renderErr
 	}
-	return tasks, deps, nil
+	return tasks, deps, envVars, nil
 }
 
 func collectTasks(plan *resolver.Plan, renderErr *RenderError) []renderTask {
@@ -106,6 +108,46 @@ func collectDependencies(plan *resolver.Plan, renderErr *RenderError) []dependen
 		}
 	}
 	return deps
+}
+
+// collectEnvVars walks plan.Modules in order, merging each module's
+// declared EnvVars. The same Name declared by two modules with identical
+// Required and Default dedupes silently (Description may differ, that's
+// just prose); a different Required or Default is a hard stop, reported
+// via EnvVarConflictError with the same anchor-against-first-seen
+// provenance posture as collectDependencies above.
+func collectEnvVars(plan *resolver.Plan, renderErr *RenderError) []manifest.EnvVar {
+	type anchor struct {
+		manifest.EnvVar
+		via string
+	}
+
+	var vars []manifest.EnvVar
+	anchors := make(map[string]anchor, len(plan.Modules))
+
+	for _, mod := range plan.Modules {
+		for _, ev := range mod.EnvVars {
+			a, ok := anchors[ev.Name]
+			if !ok {
+				anchors[ev.Name] = anchor{EnvVar: ev, via: mod.Name}
+				vars = append(vars, ev)
+				continue
+			}
+
+			if a.Required != ev.Required || a.Default != ev.Default {
+				renderErr.EnvVarConflicts = append(renderErr.EnvVarConflicts, &EnvVarConflictError{
+					Name:      ev.Name,
+					ModuleA:   a.via,
+					RequiredA: a.Required,
+					DefaultA:  a.Default,
+					ModuleB:   mod.Name,
+					RequiredB: ev.Required,
+					DefaultB:  ev.Default,
+				})
+			}
+		}
+	}
+	return vars
 }
 
 // cleanDestPath validates and cleans a manifest Template.To, independent of

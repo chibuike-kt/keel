@@ -4,15 +4,39 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"text/template"
+
+	"github.com/chibuike-kt/keel/internal/resolver"
 )
 
+// ModuleInfo is the per-module data exposed to templates under the
+// "Modules" key. It is derived by Render from plan.Modules, sorted
+// alphabetically by name — deliberately NOT plan.Modules' own dependency
+// order (topological, e.g. base last). Templates like base's README want a
+// stable, human-readable listing, not build order.
+type ModuleInfo struct {
+	Name    string
+	Summary string
+}
+
+// moduleInfos builds the sorted []ModuleInfo exposed to templates from a
+// plan's resolved modules.
+func moduleInfos(plan *resolver.Plan) []ModuleInfo {
+	infos := make([]ModuleInfo, len(plan.Modules))
+	for i, mod := range plan.Modules {
+		infos[i] = ModuleInfo{Name: mod.Name, Summary: mod.Summary}
+	}
+	sort.Slice(infos, func(i, j int) bool { return infos[i].Name < infos[j].Name })
+	return infos
+}
+
 // renderTemplate parses and executes one task's template, writing the
-// result under stagingDir. ctx is executed as a map rather than the raw
-// Context struct: with Option("missingkey=error"), a field typo'd in a
+// result under stagingDir. ctx and modules are executed as a map rather
+// than raw structs: with Option("missingkey=error"), a field typo'd in a
 // template then fails the render instead of silently printing nothing into
 // generated source.
-func (r *Renderer) renderTemplate(task renderTask, ctx Context, stagingDir string) error {
+func (r *Renderer) renderTemplate(task renderTask, ctx Context, modules []ModuleInfo, stagingDir string) error {
 	src, err := fs.ReadFile(r.templates, task.from)
 	if err != nil {
 		return &TemplateError{Module: task.module.Name, Path: task.to, Err: err}
@@ -34,17 +58,20 @@ func (r *Renderer) renderTemplate(task renderTask, ctx Context, stagingDir strin
 	}
 	defer f.Close()
 
-	if err := tmpl.Execute(f, ctxMap(ctx)); err != nil {
+	if err := tmpl.Execute(f, ctxMap(ctx, modules)); err != nil {
 		return &TemplateError{Module: task.module.Name, Path: task.to, Err: err}
 	}
 	return nil
 }
 
-// ctxMap converts Context to the map executed against templates.
-func ctxMap(ctx Context) map[string]any {
+// ctxMap converts Context and the plan's module list to the map executed
+// against templates. Modules is Render-derived and never caller-set — it
+// is not part of the Context struct itself.
+func ctxMap(ctx Context, modules []ModuleInfo) map[string]any {
 	return map[string]any{
 		"ProjectName": ctx.ProjectName,
 		"ModulePath":  ctx.ModulePath,
 		"GoVersion":   ctx.GoVersion,
+		"Modules":     modules,
 	}
 }
