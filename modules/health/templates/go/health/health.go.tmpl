@@ -1,0 +1,162 @@
+// Package health provides liveness and readiness HTTP endpoints backed by
+// a generic checker registry.
+//
+// This package has zero third-party dependencies and no knowledge of what
+// a project actually uses to determine readiness. Any mention of
+// Postgres, Redis, or another dependency in these comments is an example
+// only, not something this package imports. That's deliberate, not
+// incomplete: this module gives a project the contract (Checker,
+// Registry) to plug its own dependencies into, not a library of
+// pre-built checkers for every possible backend.
+package health
+
+import (
+	"context"
+	"sync"
+	"time"
+)
+
+// Checker reports whether a single dependency or subsystem is currently
+// able to do its job.
+//
+// Check should return promptly. The registry applies its own timeout
+// around every call (see Registry.Evaluate), but a Checker that ignores
+// ctx cancellation can still tie up a goroutine past that timeout even
+// after Evaluate has already moved on and reported it unhealthy — so
+// implementations should still respect ctx wherever the underlying client
+// supports it (e.g. passing ctx through to a Ping call), so that goroutine
+// actually stops instead of leaking.
+type Checker interface {
+	Name() string
+	Check(ctx context.Context) error
+}
+
+// CheckerFunc adapts a plain function into a Checker — the common case of
+// wrapping something with a Ping(ctx) error-shaped method, e.g.
+// health.Func("postgres", pool.Ping) or health.Func("redis", func(ctx
+// context.Context) error { return client.Ping(ctx).Err() }).
+type CheckerFunc struct {
+	name string
+	fn   func(context.Context) error
+}
+
+// Func returns a CheckerFunc named name, checked by calling fn.
+func Func(name string, fn func(context.Context) error) CheckerFunc {
+	return CheckerFunc{name: name, fn: fn}
+}
+
+// Name implements Checker.
+func (f CheckerFunc) Name() string { return f.name }
+
+// Check implements Checker.
+func (f CheckerFunc) Check(ctx context.Context) error { return f.fn(ctx) }
+
+// Result is one checker's outcome after Evaluate.
+type Result struct {
+	Name    string
+	Healthy bool
+	Error   string // empty if Healthy; the checker's error text otherwise
+}
+
+// RegistryOption configures a Registry built by NewRegistry.
+type RegistryOption func(*Registry)
+
+// WithTimeout sets the per-checker timeout Evaluate applies independently
+// to every registered Checker. Default: 5 seconds.
+func WithTimeout(d time.Duration) RegistryOption {
+	return func(r *Registry) {
+		r.timeout = d
+	}
+}
+
+// Registry holds the checkers Evaluate runs for readiness. Liveness never
+// consults a Registry at all — see handlers.go.tmpl for why that
+// separation is the whole point of having two endpoints instead of one.
+type Registry struct {
+	checkers []Checker
+	timeout  time.Duration
+}
+
+// NewRegistry returns an empty Registry.
+func NewRegistry(opts ...RegistryOption) *Registry {
+	r := &Registry{timeout: 5 * time.Second}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
+}
+
+// Register adds c to the set Evaluate runs.
+func (r *Registry) Register(c Checker) {
+	r.checkers = append(r.checkers, c)
+}
+
+// Evaluate runs every registered Checker concurrently, each under its own
+// context derived from ctx with r.timeout applied independently, and
+// returns every Result plus whether all of them were healthy.
+//
+// This is deliberately concurrent, not a sequential loop over checkers —
+// and each checker gets its own timeout, not one shared deadline for the
+// whole batch. Both choices matter for the same reason: one slow or hung
+// dependency must not delay or block the results of the others, and must
+// not make Evaluate itself wait past that one checker's own timeout. A
+// sequential implementation looks correct in review and passes a naive
+// test — each checker in isolation still reports the right thing — but
+// under real conditions with several checkers, its total latency becomes
+// the SUM of every checker's time instead of the time of the slowest one.
+// That's exactly the kind of "simplification" that turns a readiness
+// probe into a cascading timeout the moment one dependency gets slow. A
+// checker that doesn't return within its own timeout is reported
+// unhealthy with a "check timed out" error; Evaluate does not wait for it
+// any longer than that, even if the checker itself never returns.
+func (r *Registry) Evaluate(ctx context.Context) ([]Result, bool) {
+	results := make([]Result, len(r.checkers))
+
+	var wg sync.WaitGroup
+	wg.Add(len(r.checkers))
+	for i, c := range r.checkers {
+		go func(i int, c Checker) {
+			defer wg.Done()
+			results[i] = r.runOne(ctx, c)
+		}(i, c)
+	}
+	wg.Wait()
+
+	allHealthy := true
+	for _, res := range results {
+		if !res.Healthy {
+			allHealthy = false
+			break
+		}
+	}
+	return results, allHealthy
+}
+
+// runOne runs a single Checker under its own timeout, in its own
+// goroutine. The goroutine is necessary, not just the context: a Checker
+// that ignores ctx entirely (blocks on a channel that's never sent to,
+// for example) would otherwise make this call — and therefore Evaluate —
+// hang forever waiting for it to return. Racing the check against
+// checkCtx.Done() with select is what guarantees runOne itself returns
+// within approximately r.timeout regardless of whether the Checker
+// cooperates; the cost, when a Checker doesn't cooperate, is that its
+// goroutine leaks rather than Evaluate hanging.
+func (r *Registry) runOne(ctx context.Context, c Checker) Result {
+	checkCtx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Check(checkCtx)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return Result{Name: c.Name(), Healthy: false, Error: err.Error()}
+		}
+		return Result{Name: c.Name(), Healthy: true}
+	case <-checkCtx.Done():
+		return Result{Name: c.Name(), Healthy: false, Error: "check timed out"}
+	}
+}

@@ -1,0 +1,20 @@
+apiVersion: keel/v1
+name: health
+version: 0.1.0
+summary: "Liveness and readiness HTTP endpoints backed by a generic, dependency-free checker registry."
+tags: [reliability]
+
+requires: []
+conflicts: []
+
+languages:
+  go:
+    templates:
+      - from: templates/go/health/health.go.tmpl
+        to: internal/health/health.go
+      - from: templates/go/health/handlers.go.tmpl
+        to: internal/health/handlers.go
+      - from: templates/go/health/health_test.go.tmpl
+        to: internal/health/health_test.go
+      - from: templates/go/health/handlers_test.go.tmpl
+        to: internal/health/handlers_test.go
