@@ -230,6 +230,51 @@ func TestValidate(t *testing.T) {
 			},
 			wantField: "languages.go.dependencies[1]",
 		},
+		{
+			name: "env var name empty",
+			mutate: func(m *Manifest) {
+				m.EnvVars = []EnvVar{{Name: "", Description: "d"}}
+			},
+			wantField: "env[0].name",
+		},
+		{
+			name: "env var name lowercase",
+			mutate: func(m *Manifest) {
+				m.EnvVars = []EnvVar{{Name: "database_url", Description: "d"}}
+			},
+			wantField: "env[0].name",
+		},
+		{
+			name: "env var name invalid characters",
+			mutate: func(m *Manifest) {
+				m.EnvVars = []EnvVar{{Name: "DATABASE-URL", Description: "d"}}
+			},
+			wantField: "env[0].name",
+		},
+		{
+			name: "env var description empty",
+			mutate: func(m *Manifest) {
+				m.EnvVars = []EnvVar{{Name: "DATABASE_URL", Description: ""}}
+			},
+			wantField: "env[0].description",
+		},
+		{
+			name: "env var required and default both set",
+			mutate: func(m *Manifest) {
+				m.EnvVars = []EnvVar{{Name: "DATABASE_URL", Description: "d", Required: true, Default: "postgres://localhost"}}
+			},
+			wantField: "env[0]",
+		},
+		{
+			name: "env var duplicate name",
+			mutate: func(m *Manifest) {
+				m.EnvVars = []EnvVar{
+					{Name: "DATABASE_URL", Description: "d"},
+					{Name: "DATABASE_URL", Description: "d again"},
+				}
+			},
+			wantField: "env[1].name",
+		},
 	}
 
 	for _, tt := range tests {
@@ -270,5 +315,49 @@ func TestValidateAggregatesAllErrors(t *testing.T) {
 	}
 	if len(verr.Errors) < 3 {
 		t.Fatalf("Validate() found %d errors, want at least 3: %v", len(verr.Errors), verr.Errors)
+	}
+}
+
+func TestValidateAggregatesAllEnvVarErrors(t *testing.T) {
+	m := validManifest()
+	m.EnvVars = []EnvVar{
+		{Name: "", Description: ""},
+		{Name: "bad-name", Description: "d", Required: true, Default: "x"},
+	}
+
+	err := Validate(m)
+	var verr *ValidationError
+	if !errors.As(err, &verr) {
+		t.Fatalf("Validate() error type = %T, want *ValidationError", err)
+	}
+
+	wantFields := map[string]bool{
+		"env[0].name":        false,
+		"env[0].description": false,
+		"env[1].name":        false,
+		"env[1]":             false,
+	}
+	for _, fe := range verr.Errors {
+		if _, ok := wantFields[fe.Field]; ok {
+			wantFields[fe.Field] = true
+		}
+	}
+	for field, found := range wantFields {
+		if !found {
+			t.Fatalf("Validate() errors = %v, want one naming field %q", verr.Errors, field)
+		}
+	}
+}
+
+func TestValidateEnvVarsGolden(t *testing.T) {
+	m := validManifest()
+	m.EnvVars = []EnvVar{
+		{Name: "DATABASE_URL", Description: "PostgreSQL connection string", Required: true},
+		{Name: "PORT", Description: "HTTP server port", Required: false, Default: "8080"},
+		{Name: "LOG_LEVEL", Description: "Minimum log level", Required: false, Default: "info"},
+	}
+
+	if err := Validate(m); err != nil {
+		t.Fatalf("Validate(valid manifest with env vars) = %v, want nil", err)
 	}
 }

@@ -9,8 +9,9 @@ import (
 )
 
 var (
-	nameRE    = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
-	versionRE = regexp.MustCompile(`^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$`)
+	nameRE       = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
+	versionRE    = regexp.MustCompile(`^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$`)
+	envVarNameRE = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
 )
 
 var knownLanguages = map[string]bool{
@@ -55,6 +56,7 @@ func Validate(m *Manifest) error {
 
 	validateIdentity(errs, m)
 	validateLists(errs, m)
+	validateEnvVars(errs, m)
 	validateLanguages(errs, m)
 
 	if len(errs.Errors) == 0 {
@@ -132,6 +134,35 @@ func validateLists(errs *ValidationError, m *Manifest) {
 		if conflicts[name] {
 			errs.add("requires", "%q must not appear in both requires and conflicts", name)
 		}
+	}
+}
+
+func validateEnvVars(errs *ValidationError, m *Manifest) {
+	seen := make(map[string]bool, len(m.EnvVars))
+	for i, ev := range m.EnvVars {
+		validateEnvVar(errs, fmt.Sprintf("env[%d]", i), ev, seen)
+	}
+}
+
+func validateEnvVar(errs *ValidationError, field string, ev EnvVar, seen map[string]bool) {
+	if ev.Name == "" {
+		errs.add(field+".name", "is required")
+	} else {
+		if !envVarNameRE.MatchString(ev.Name) {
+			errs.add(field+".name", "must match %s, got %q", envVarNameRE.String(), ev.Name)
+		}
+		if seen[ev.Name] {
+			errs.add(field+".name", "duplicates another entry in env")
+		}
+		seen[ev.Name] = true
+	}
+
+	if ev.Description == "" {
+		errs.add(field+".description", "is required")
+	}
+
+	if ev.Required && ev.Default != "" {
+		errs.add(field, "must not set default when required is true (a var with a default isn't really required)")
 	}
 }
 
