@@ -1,0 +1,69 @@
+package health
+
+import (
+	"encoding/json"
+	"net/http"
+)
+
+// Liveness returns a handler that always responds 200 OK with a minimal
+// body, doing no checks of any kind — not the registry, not any external
+// call.
+//
+// Liveness answers one question: should this process be restarted? A
+// downstream dependency being unavailable is not that question — checking
+// Postgres here would make an orchestrator restart a perfectly healthy
+// process just because Postgres is having a bad moment, which fixes
+// nothing (the new process hits the same unavailable Postgres) and stacks
+// a restart loop on top of an outage that isn't this process's fault.
+// That's why this handler doesn't take a Registry at all: it can't
+// consult one even by accident.
+func Liveness() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}
+}
+
+// readinessBody is the JSON shape both healthy and unhealthy Readiness
+// responses share.
+type readinessBody struct {
+	Status string            `json:"status"`
+	Checks map[string]string `json:"checks"`
+}
+
+// Readiness returns a handler that runs registry.Evaluate against the
+// incoming request's context — so a client disconnect or the server's own
+// shutdown can still cancel in-flight checks — and responds 200 if every
+// checker is healthy, 503 otherwise. The response body always has the
+// same shape, Content-Type application/json:
+//
+//	{"status": "ok", "checks": {"postgres": "ok"}}
+//	{"status": "unhealthy", "checks": {"postgres": "failed: connection refused"}}
+func Readiness(registry *Registry) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		results, allHealthy := registry.Evaluate(r.Context())
+
+		body := readinessBody{Checks: make(map[string]string, len(results))}
+		if allHealthy {
+			body.Status = "ok"
+		} else {
+			body.Status = "unhealthy"
+		}
+		for _, res := range results {
+			if res.Healthy {
+				body.Checks[res.Name] = "ok"
+			} else {
+				body.Checks[res.Name] = "failed: " + res.Error
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if allHealthy {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		_ = json.NewEncoder(w).Encode(body)
+	}
+}
