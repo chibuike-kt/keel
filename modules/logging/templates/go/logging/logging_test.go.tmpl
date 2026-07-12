@@ -1,0 +1,138 @@
+package logging
+
+import (
+	"bytes"
+	"encoding/json"
+	"log/slog"
+	"strings"
+	"testing"
+)
+
+func TestNewDevelopmentProducesTextOutput(t *testing.T) {
+	var buf bytes.Buffer
+	logger := New(Development, &buf)
+	logger.Info("hello", "foo", "bar")
+
+	out := buf.String()
+	if json.Valid([]byte(out)) {
+		t.Fatalf("Development output looks like JSON, want key=value text: %s", out)
+	}
+	if !strings.Contains(out, "msg=hello") {
+		t.Fatalf("output = %q, want it to contain msg=hello (slog.TextHandler shape)", out)
+	}
+	if !strings.Contains(out, "foo=bar") {
+		t.Fatalf("output = %q, want it to contain foo=bar", out)
+	}
+}
+
+func TestNewProductionProducesValidJSON(t *testing.T) {
+	var buf bytes.Buffer
+	logger := New(Production, &buf)
+	logger.Info("hello", "foo", "bar")
+
+	var decoded map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &decoded); err != nil {
+		t.Fatalf("Production output is not valid JSON: %v\noutput: %s", err, buf.String())
+	}
+	if decoded["msg"] != "hello" {
+		t.Fatalf(`decoded["msg"] = %v, want "hello"`, decoded["msg"])
+	}
+	if decoded["foo"] != "bar" {
+		t.Fatalf(`decoded["foo"] = %v, want "bar"`, decoded["foo"])
+	}
+	if _, ok := decoded["time"]; !ok {
+		t.Fatal(`decoded output missing "time" key`)
+	}
+	if _, ok := decoded["level"]; !ok {
+		t.Fatal(`decoded output missing "level" key`)
+	}
+}
+
+func TestNewRedactsDefaultListField(t *testing.T) {
+	var buf bytes.Buffer
+	logger := New(Production, &buf)
+	logger.Info("login attempt", "password", "hunter2")
+
+	var decoded map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &decoded); err != nil {
+		t.Fatalf("output is not valid JSON: %v", err)
+	}
+	if decoded["password"] != "[REDACTED]" {
+		t.Fatalf(`decoded["password"] = %v, want "[REDACTED]"`, decoded["password"])
+	}
+}
+
+func TestNewRedactsCaseInsensitively(t *testing.T) {
+	for _, key := range []string{"Password", "PASSWORD"} {
+		t.Run(key, func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := New(Production, &buf)
+			logger.Info("login attempt", key, "hunter2")
+
+			var decoded map[string]any
+			if err := json.Unmarshal(buf.Bytes(), &decoded); err != nil {
+				t.Fatalf("output is not valid JSON: %v", err)
+			}
+			if decoded[key] != "[REDACTED]" {
+				t.Fatalf("decoded[%q] = %v, want \"[REDACTED]\"", key, decoded[key])
+			}
+		})
+	}
+}
+
+func TestNewRedactsAttrsAttachedViaWith(t *testing.T) {
+	var buf bytes.Buffer
+	base := New(Production, &buf)
+	// Attached via With before any log call — this proves redaction
+	// happens at WithAttrs time, not only inside Handle.
+	logger := base.With("api_key", "sk_live_abc123")
+	logger.Info("request made")
+
+	var decoded map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &decoded); err != nil {
+		t.Fatalf("output is not valid JSON: %v", err)
+	}
+	if decoded["api_key"] != "[REDACTED]" {
+		t.Fatalf(`decoded["api_key"] = %v, want "[REDACTED]"`, decoded["api_key"])
+	}
+}
+
+func TestNewRedactsFieldsNestedInGroup(t *testing.T) {
+	var buf bytes.Buffer
+	logger := New(Production, &buf)
+	logger.Info("charge created", slog.Group("customer", slog.String("card_number", "4242424242424242")))
+
+	var decoded map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &decoded); err != nil {
+		t.Fatalf("output is not valid JSON: %v", err)
+	}
+	customer, ok := decoded["customer"].(map[string]any)
+	if !ok {
+		t.Fatalf(`decoded["customer"] = %v (%T), want a nested object`, decoded["customer"], decoded["customer"])
+	}
+	if customer["card_number"] != "[REDACTED]" {
+		t.Fatalf(`decoded["customer"]["card_number"] = %v, want "[REDACTED]"`, customer["card_number"])
+	}
+}
+
+func TestNewRedactsCustomFieldButLeavesOthersAlone(t *testing.T) {
+	// A custom field must be redacted, and — just as importantly — a field
+	// in neither the default nor custom list must pass through unredacted.
+	// A test that only checked the redacted field would pass equally well
+	// for a handler that redacts everything indiscriminately; this proves
+	// redaction is scoped to the configured fields, not a blanket filter.
+	var buf bytes.Buffer
+	logger := New(Production, &buf, "customer_ssn")
+	logger.Info("kyc check", "customer_ssn", "123-45-6789", "customer_name", "Jane Doe")
+
+	var decoded map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &decoded); err != nil {
+		t.Fatalf("output is not valid JSON: %v", err)
+	}
+	if decoded["customer_ssn"] != "[REDACTED]" {
+		t.Fatalf(`decoded["customer_ssn"] = %v, want "[REDACTED]"`, decoded["customer_ssn"])
+	}
+	if decoded["customer_name"] != "Jane Doe" {
+		t.Fatalf(`decoded["customer_name"] = %v, want "Jane Doe" (unredacted)`, decoded["customer_name"])
+	}
+}

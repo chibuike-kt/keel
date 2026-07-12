@@ -1,0 +1,136 @@
+// Package logging provides structured logging via log/slog, request-scoped
+// correlation via context, and automatic redaction of known-sensitive
+// fields.
+package logging
+
+import (
+	"context"
+	"io"
+	"log/slog"
+	"strings"
+)
+
+// Environment selects a Logger's output shape.
+type Environment string
+
+const (
+	Development Environment = "development"
+	Production  Environment = "production"
+)
+
+// DefaultRedactedFields is the built-in list of attribute keys New always
+// redacts, matched case-insensitively. This is a known-dangerous-keys
+// list, not a claim of comprehensive PII detection: it redacts fields it
+// recognizes by name, nothing more. Callers with domain-specific sensitive
+// fields (an account number, a customer SSN under a different key name,
+// and so on) should pass those names to New as additional redactFields.
+var DefaultRedactedFields = []string{
+	"password", "passwd", "secret", "api_key", "apikey", "access_token",
+	"refresh_token", "token", "authorization", "card_number", "cvv", "cvc",
+	"pin", "ssn",
+}
+
+// New returns a *slog.Logger appropriate for env: human-readable
+// key=value text (slog.TextHandler) for Development, structured JSON
+// (slog.JSONHandler) for Production. The same application code logs the
+// same way in both; only the output shape changes, so local development
+// stays readable while production output is ingestible by a log
+// aggregator (ELK, Loki, Datadog, Cloud Logging, ...) without any code
+// change.
+//
+// Every attribute whose key case-insensitively matches DefaultRedactedFields
+// or one of redactFields is redacted to "[REDACTED]" before it reaches w —
+// including attributes attached with Logger.With and attributes nested
+// inside slog.Group. See redactingHandler.
+func New(env Environment, w io.Writer, redactFields ...string) *slog.Logger {
+	var handler slog.Handler
+	switch env {
+	case Production:
+		handler = slog.NewJSONHandler(w, nil)
+	default:
+		handler = slog.NewTextHandler(w, nil)
+	}
+
+	fields := make([]string, 0, len(DefaultRedactedFields)+len(redactFields))
+	fields = append(fields, DefaultRedactedFields...)
+	fields = append(fields, redactFields...)
+
+	return slog.New(newRedactingHandler(handler, fields))
+}
+
+// redactingHandler wraps another slog.Handler, redacting the value of any
+// attribute whose key case-insensitively matches an entry in fields,
+// replacing it with the string "[REDACTED]".
+//
+// This has to catch redaction at every level slog exposes, not just a log
+// call's immediate arguments:
+//
+//   - Attributes passed directly to a log call arrive through Handle.
+//   - Attributes attached via logger.With(...) arrive through WithAttrs,
+//     and become part of the returned handler's persistent state — they
+//     never pass through Handle at all, so redacting only inside Handle
+//     would silently let anything attached via With() leak unredacted.
+//   - Attributes nested inside slog.Group(...) are themselves slog.Attr
+//     values of Kind slog.KindGroup, carrying a nested []slog.Attr. A
+//     sensitive field nested under a group (slog.Group("customer",
+//     slog.String("card_number", ...))) is exactly as real a leak as a
+//     top-level one, so redactAttr recurses into group values rather than
+//     only inspecting the top level. This recursion is the part of this
+//     file most likely to be "simplified" away by someone who only tests
+//     the flat, top-level case — it is load-bearing, not incidental.
+type redactingHandler struct {
+	next   slog.Handler
+	fields map[string]struct{}
+}
+
+func newRedactingHandler(next slog.Handler, fields []string) *redactingHandler {
+	set := make(map[string]struct{}, len(fields))
+	for _, f := range fields {
+		set[strings.ToLower(f)] = struct{}{}
+	}
+	return &redactingHandler{next: next, fields: set}
+}
+
+func (h *redactingHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.next.Enabled(ctx, level)
+}
+
+func (h *redactingHandler) Handle(ctx context.Context, r slog.Record) error {
+	redacted := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
+	r.Attrs(func(a slog.Attr) bool {
+		redacted.AddAttrs(h.redactAttr(a))
+		return true
+	})
+	return h.next.Handle(ctx, redacted)
+}
+
+func (h *redactingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	redacted := make([]slog.Attr, len(attrs))
+	for i, a := range attrs {
+		redacted[i] = h.redactAttr(a)
+	}
+	return &redactingHandler{next: h.next.WithAttrs(redacted), fields: h.fields}
+}
+
+func (h *redactingHandler) WithGroup(name string) slog.Handler {
+	return &redactingHandler{next: h.next.WithGroup(name), fields: h.fields}
+}
+
+// redactAttr redacts a, recursing into its nested attributes first if it's
+// a group — see the type comment on redactingHandler for why this
+// recursion is required, not optional.
+func (h *redactingHandler) redactAttr(a slog.Attr) slog.Attr {
+	if a.Value.Kind() == slog.KindGroup {
+		group := a.Value.Group()
+		redactedGroup := make([]slog.Attr, len(group))
+		for i, ga := range group {
+			redactedGroup[i] = h.redactAttr(ga)
+		}
+		return slog.Attr{Key: a.Key, Value: slog.GroupValue(redactedGroup...)}
+	}
+
+	if _, sensitive := h.fields[strings.ToLower(a.Key)]; sensitive {
+		return slog.Attr{Key: a.Key, Value: slog.StringValue("[REDACTED]")}
+	}
+	return a
+}

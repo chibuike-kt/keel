@@ -1,0 +1,24 @@
+apiVersion: keel/v1
+name: logging
+version: 0.1.0
+summary: "Structured logging via slog with request-scoped correlation IDs and automatic field redaction."
+tags: [reliability, security]
+
+requires: []
+conflicts: []
+
+languages:
+  go:
+    templates:
+      - from: templates/go/logging/logging.go.tmpl
+        to: internal/logging/logging.go
+      - from: templates/go/logging/context.go.tmpl
+        to: internal/logging/context.go
+      - from: templates/go/logging/middleware.go.tmpl
+        to: internal/logging/middleware.go
+      - from: templates/go/logging/logging_test.go.tmpl
+        to: internal/logging/logging_test.go
+      - from: templates/go/logging/context_test.go.tmpl
+        to: internal/logging/context_test.go
+      - from: templates/go/logging/middleware_test.go.tmpl
+        to: internal/logging/middleware_test.go
