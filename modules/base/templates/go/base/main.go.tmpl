@@ -1,0 +1,16 @@
+package main
+
+import (
+	"log"
+	"net/http"
+)
+
+func main() {
+	mux := http.NewServeMux()
+
+	addr := ":8080"
+	log.Printf("{{.ProjectName}} listening on %s", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.Fatal(err)
+	}
+}

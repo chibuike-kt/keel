@@ -1,0 +1,24 @@
+apiVersion: keel/v1
+name: base
+version: 0.1.0
+summary: "Foundation for every generated project: README, .gitignore, and a starter main.go."
+tags: [scaffold]
+
+requires: []
+conflicts: []
+
+# No env vars of its own. PORT and ENVIRONMENT are owned by the config
+# module (see its Part 5 retrofit), not base — base has no code that reads
+# them, and declaring them here would duplicate config's declaration and
+# force every project to carry config just to satisfy base.
+env: []
+
+languages:
+  go:
+    templates:
+      - from: templates/go/base/gitignore.tmpl
+        to: .gitignore
+      - from: templates/go/base/readme.md.tmpl
+        to: README.md
+      - from: templates/go/base/main.go.tmpl
+        to: cmd/api/main.go
