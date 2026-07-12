@@ -1,0 +1,92 @@
+package health
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestLivenessAlwaysReturns200(t *testing.T) {
+	// Liveness takes no Registry at all — this is the architectural proof
+	// that it's impossible for it to consult one, not just that it
+	// happens not to today.
+	handler := Liveness()
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+}
+
+func TestReadinessAllHealthy(t *testing.T) {
+	r := NewRegistry()
+	r.Register(Func("postgres", func(ctx context.Context) error { return nil }))
+	r.Register(Func("redis", func(ctx context.Context) error { return nil }))
+
+	handler := Readiness(r)
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want %q", got, "application/json")
+	}
+
+	var body struct {
+		Status string            `json:"status"`
+		Checks map[string]string `json:"checks"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body is not valid JSON: %v", err)
+	}
+	if body.Status != "ok" {
+		t.Fatalf(`status = %q, want "ok"`, body.Status)
+	}
+	if body.Checks["postgres"] != "ok" || body.Checks["redis"] != "ok" {
+		t.Fatalf("checks = %+v, want both ok", body.Checks)
+	}
+}
+
+func TestReadinessWithFailingChecker(t *testing.T) {
+	r := NewRegistry()
+	r.Register(Func("postgres", func(ctx context.Context) error { return nil }))
+	r.Register(Func("redis", func(ctx context.Context) error { return errors.New("connection refused") }))
+
+	handler := Readiness(r)
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want %q", got, "application/json")
+	}
+
+	var body struct {
+		Status string            `json:"status"`
+		Checks map[string]string `json:"checks"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body is not valid JSON: %v", err)
+	}
+	if body.Status != "unhealthy" {
+		t.Fatalf(`status = %q, want "unhealthy"`, body.Status)
+	}
+	if body.Checks["postgres"] != "ok" {
+		t.Fatalf(`checks["postgres"] = %q, want "ok"`, body.Checks["postgres"])
+	}
+	if body.Checks["redis"] != "failed: connection refused" {
+		t.Fatalf(`checks["redis"] = %q, want "failed: connection refused"`, body.Checks["redis"])
+	}
+}

@@ -1,0 +1,169 @@
+package health
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+)
+
+func TestFuncAdaptsPlainFunction(t *testing.T) {
+	called := false
+	c := Func("thing", func(ctx context.Context) error {
+		called = true
+		return nil
+	})
+
+	if c.Name() != "thing" {
+		t.Fatalf("Name() = %q, want %q", c.Name(), "thing")
+	}
+	if err := c.Check(context.Background()); err != nil {
+		t.Fatalf("Check(): %v", err)
+	}
+	if !called {
+		t.Fatal("the wrapped function was not called")
+	}
+}
+
+func TestEvaluateAllHealthy(t *testing.T) {
+	r := NewRegistry()
+	r.Register(Func("a", func(ctx context.Context) error { return nil }))
+	r.Register(Func("b", func(ctx context.Context) error { return nil }))
+
+	results, allHealthy := r.Evaluate(context.Background())
+	if !allHealthy {
+		t.Fatalf("allHealthy = false, want true; results = %+v", results)
+	}
+	if len(results) != 2 {
+		t.Fatalf("len(results) = %d, want 2", len(results))
+	}
+	for _, res := range results {
+		if !res.Healthy {
+			t.Fatalf("result %+v: Healthy = false, want true", res)
+		}
+		if res.Error != "" {
+			t.Fatalf("result %+v: Error = %q, want empty", res, res.Error)
+		}
+	}
+}
+
+func TestEvaluateOneFailingDoesNotCorruptOthers(t *testing.T) {
+	r := NewRegistry()
+	r.Register(Func("good-a", func(ctx context.Context) error { return nil }))
+	r.Register(Func("bad", func(ctx context.Context) error { return errors.New("connection refused") }))
+	r.Register(Func("good-b", func(ctx context.Context) error { return nil }))
+
+	results, allHealthy := r.Evaluate(context.Background())
+	if allHealthy {
+		t.Fatal("allHealthy = true, want false (one checker failed)")
+	}
+
+	byName := make(map[string]Result, len(results))
+	for _, res := range results {
+		byName[res.Name] = res
+	}
+
+	bad := byName["bad"]
+	if bad.Healthy {
+		t.Fatal(`result "bad": Healthy = true, want false`)
+	}
+	if bad.Error != "connection refused" {
+		t.Fatalf(`result "bad": Error = %q, want "connection refused"`, bad.Error)
+	}
+
+	for _, name := range []string{"good-a", "good-b"} {
+		res := byName[name]
+		if !res.Healthy {
+			t.Fatalf("result %q: Healthy = false, want true (one failure must not affect other checkers)", name)
+		}
+	}
+}
+
+func TestEvaluateRunsCheckersConcurrently(t *testing.T) {
+	const n = 5
+	const sleep = 100 * time.Millisecond
+
+	r := NewRegistry(WithTimeout(time.Second))
+	for i := 0; i < n; i++ {
+		r.Register(Func("slow", func(ctx context.Context) error {
+			time.Sleep(sleep)
+			return nil
+		}))
+	}
+
+	start := time.Now()
+	_, allHealthy := r.Evaluate(context.Background())
+	elapsed := time.Since(start)
+
+	if !allHealthy {
+		t.Fatal("allHealthy = false, want true")
+	}
+	// Sequential execution would take roughly n*sleep (500ms here);
+	// concurrent execution takes roughly one sleep. This is the test that
+	// actually distinguishes the two implementations, not just a vague
+	// "is fast enough" bound.
+	if elapsed >= n*sleep {
+		t.Fatalf("Evaluate took %v for %d checkers sleeping %v each — looks sequential, want close to one sleep duration", elapsed, n, sleep)
+	}
+	if elapsed < sleep {
+		t.Fatalf("Evaluate took %v, want at least %v (the checkers' own sleep)", elapsed, sleep)
+	}
+}
+
+func TestEvaluatePerCheckerTimeout(t *testing.T) {
+	const timeout = 50 * time.Millisecond
+
+	r := NewRegistry(WithTimeout(timeout))
+	r.Register(Func("hangs-forever", func(ctx context.Context) error {
+		block := make(chan struct{})
+		<-block // never sent to; this checker ignores ctx entirely
+		return nil
+	}))
+	r.Register(Func("fast", func(ctx context.Context) error { return nil }))
+
+	start := time.Now()
+	results, allHealthy := r.Evaluate(context.Background())
+	elapsed := time.Since(start)
+
+	if allHealthy {
+		t.Fatal("allHealthy = true, want false (one checker times out)")
+	}
+	// A generous multiple of timeout, not an exact bound: this only needs
+	// to prove Evaluate didn't hang waiting on the blocked checker
+	// forever.
+	if elapsed > 20*timeout {
+		t.Fatalf("Evaluate took %v with a %v per-checker timeout — it should not wait for a hung checker", elapsed, timeout)
+	}
+
+	byName := make(map[string]Result, len(results))
+	for _, res := range results {
+		byName[res.Name] = res
+	}
+
+	hung := byName["hangs-forever"]
+	if hung.Healthy {
+		t.Fatal(`result "hangs-forever": Healthy = true, want false`)
+	}
+	if hung.Error == "" {
+		t.Fatal(`result "hangs-forever": Error is empty, want a timeout-indicating message`)
+	}
+
+	fast := byName["fast"]
+	if !fast.Healthy {
+		t.Fatal(`result "fast": Healthy = false, want true`)
+	}
+}
+
+func TestNewRegistryDefaultTimeoutIsFiveSeconds(t *testing.T) {
+	r := NewRegistry()
+	if r.timeout != 5*time.Second {
+		t.Fatalf("default timeout = %v, want %v", r.timeout, 5*time.Second)
+	}
+}
+
+func TestWithTimeoutOverridesDefault(t *testing.T) {
+	r := NewRegistry(WithTimeout(250 * time.Millisecond))
+	if r.timeout != 250*time.Millisecond {
+		t.Fatalf("timeout = %v, want %v", r.timeout, 250*time.Millisecond)
+	}
+}
