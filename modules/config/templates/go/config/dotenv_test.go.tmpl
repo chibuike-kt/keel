@@ -1,0 +1,111 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestParseDotEnvValidFile(t *testing.T) {
+	input := "FOO=bar\nBAZ=qux\n"
+	values, err := parseDotEnv(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parseDotEnv: %v", err)
+	}
+	if values["FOO"] != "bar" {
+		t.Fatalf(`values["FOO"] = %q, want "bar"`, values["FOO"])
+	}
+	if values["BAZ"] != "qux" {
+		t.Fatalf(`values["BAZ"] = %q, want "qux"`, values["BAZ"])
+	}
+}
+
+func TestParseDotEnvIgnoresCommentsAndBlankLines(t *testing.T) {
+	input := "# a comment\n\nFOO=bar\n   \n# another comment\nBAZ=qux\n"
+	values, err := parseDotEnv(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parseDotEnv: %v", err)
+	}
+	if len(values) != 2 {
+		t.Fatalf("len(values) = %d, want 2 (comments and blank lines must not become entries): %+v", len(values), values)
+	}
+}
+
+func TestParseDotEnvLineWithoutEqualsErrors(t *testing.T) {
+	input := "FOO=bar\nTHIS_LINE_IS_BROKEN\n"
+	_, err := parseDotEnv(strings.NewReader(input))
+	if err == nil {
+		t.Fatal("parseDotEnv() error = nil, want an error for a line with no '='")
+	}
+}
+
+func TestParseDotEnvStripsSurroundingQuotes(t *testing.T) {
+	input := `FOO="quoted value"` + "\n"
+	values, err := parseDotEnv(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parseDotEnv: %v", err)
+	}
+	if values["FOO"] != "quoted value" {
+		t.Fatalf(`values["FOO"] = %q, want "quoted value"`, values["FOO"])
+	}
+}
+
+func TestLoadDotEnvRealEnvVarWins(t *testing.T) {
+	// This is the test that actually proves "real env vars win," not just
+	// documents it.
+	t.Setenv("SHARED_KEY", "real-value")
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	if err := os.WriteFile(path, []byte("SHARED_KEY=dotenv-value\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if err := loadDotEnv(path); err != nil {
+		t.Fatalf("loadDotEnv: %v", err)
+	}
+
+	if got := os.Getenv("SHARED_KEY"); got != "real-value" {
+		t.Fatalf(`os.Getenv("SHARED_KEY") = %q, want the pre-existing real value %q, not the .env value`, got, "real-value")
+	}
+}
+
+func TestLoadDotEnvSetsUnsetKeys(t *testing.T) {
+	t.Cleanup(func() { os.Unsetenv("ONLY_IN_DOTENV") })
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	if err := os.WriteFile(path, []byte("ONLY_IN_DOTENV=hello\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if err := loadDotEnv(path); err != nil {
+		t.Fatalf("loadDotEnv: %v", err)
+	}
+
+	if got := os.Getenv("ONLY_IN_DOTENV"); got != "hello" {
+		t.Fatalf(`os.Getenv("ONLY_IN_DOTENV") = %q, want "hello"`, got)
+	}
+}
+
+func TestLoadDotEnvMissingFileIsNoOp(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "does-not-exist.env")
+
+	if err := loadDotEnv(path); err != nil {
+		t.Fatalf("loadDotEnv() error = %v, want nil for a missing file (not a misconfiguration)", err)
+	}
+}
+
+func TestLoadDotEnvMalformedFileErrors(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	if err := os.WriteFile(path, []byte("THIS_LINE_IS_BROKEN\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if err := loadDotEnv(path); err == nil {
+		t.Fatal("loadDotEnv() error = nil, want an error for a malformed .env file")
+	}
+}
