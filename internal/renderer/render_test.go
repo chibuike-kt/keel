@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"testing/fstest"
 
@@ -342,5 +343,14 @@ func TestRenderEnvExampleDeterministicAcrossRepeatedCalls(t *testing.T) {
 	}
 	if string(a) != string(b) {
 		t.Fatalf(".env.example not byte-identical across repeated Render calls:\na = %q\nb = %q", a, b)
+	}
+
+	// moduleA (declaring ZOO_URL) comes before moduleB (declaring APP_NAME)
+	// in plan.Modules — if writeEnvExample's sort were removed, output
+	// order would follow that declaration order and ZOO_URL would appear
+	// first. Asserting APP_NAME comes first actually exercises the sort,
+	// rather than only re-confirming call-to-call stability.
+	if got := string(a); strings.Index(got, "APP_NAME") > strings.Index(got, "ZOO_URL") {
+		t.Fatalf(".env.example not sorted alphabetically (APP_NAME should precede ZOO_URL): %q", got)
 	}
 }
