@@ -13,7 +13,26 @@ type Manifest struct {
 	Requires  []string `yaml:"requires"`
 	Conflicts []string `yaml:"conflicts"`
 
+	// EnvVars describes the environment variables a project needs to
+	// configure when this module is selected. It does not mean this
+	// module's own Go code calls os.Getenv directly — none of the shipped
+	// modules do; secrets and settings are passed as constructor
+	// parameters instead (e.g. ProviderStripe(secret)). This field exists
+	// so tooling — the renderer's env var aggregation — can generate an
+	// accurate .env.example for the generated project, not to describe
+	// this module's internal implementation.
+	EnvVars []EnvVar `yaml:"env"`
+
 	Languages map[string]Language `yaml:"languages"`
+}
+
+// EnvVar describes one environment variable a project needs to configure
+// when the declaring module is selected.
+type EnvVar struct {
+	Name        string `yaml:"name"`
+	Description string `yaml:"description"`
+	Required    bool   `yaml:"required"`
+	Default     string `yaml:"default"` // must be empty when Required is true
 }
 
 // Language is a per-language implementation of a module: the dependencies it
