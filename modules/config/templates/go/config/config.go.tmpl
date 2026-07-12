@@ -1,0 +1,83 @@
+package config
+
+// Environment is the deployment environment a Config was loaded for.
+type Environment string
+
+const (
+	Development Environment = "development"
+	Staging     Environment = "staging"
+	Production  Environment = "production"
+)
+
+// Config is the example configuration shape this module ships with. A
+// generated project extends it with its own fields — DATABASE_URL,
+// PAYSTACK_SECRET_KEY, and so on — following the exact pattern shown in
+// Load below. This module has zero coupling to any particular database,
+// provider, or backend; Environment and Port exist only to demonstrate
+// the pattern with something every project needs, the same posture as
+// the health module's checkers being domain-agnostic.
+type Config struct {
+	Environment Environment
+	Port        int
+}
+
+type loadOptions struct {
+	dotEnvPath string
+}
+
+// Option configures Load.
+type Option func(*loadOptions)
+
+// WithDotEnv enables loading a .env file — path if given, ".env" if
+// called with no argument — before real environment variables are read.
+// This is explicitly opt-in: Load without this option never touches the
+// filesystem, only os.Getenv.
+//
+// Intended for local development only. Do not enable this in a
+// production container: production should get its configuration from
+// real environment variables set by the deployment platform, not from a
+// file that happens to be present in the image.
+func WithDotEnv(path ...string) Option {
+	p := ".env"
+	if len(path) > 0 {
+		p = path[0]
+	}
+	return func(o *loadOptions) {
+		o.dotEnvPath = p
+	}
+}
+
+// Load builds a Config from environment variables — plus, if WithDotEnv
+// was passed, a .env file read first — failing fast: if any required
+// variable is missing, or any variable (required or optional) is present
+// but invalid, Load returns a single combined error naming every problem
+// found, and a zero-value Config that must not be used.
+//
+// This is the pattern a generated project extends: add fields to Config,
+// add the corresponding l.mustX/getX call here, following the exact shape
+// shown below.
+func Load(opts ...Option) (Config, error) {
+	var o loadOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	if o.dotEnvPath != "" {
+		if err := loadDotEnv(o.dotEnvPath); err != nil {
+			return Config{}, err
+		}
+	}
+
+	l := &loader{}
+	cfg := Config{
+		Environment: Environment(l.oneOf("ENVIRONMENT",
+			l.getString("ENVIRONMENT", string(Development)),
+			string(Development), string(Staging), string(Production))),
+		Port: l.getInt("PORT", 8080),
+	}
+	l.require(cfg.Port > 0 && cfg.Port <= 65535, "PORT must be between 1 and 65535")
+
+	if err := l.err(); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
