@@ -1,0 +1,174 @@
+// Package config loads application configuration from environment
+// variables — plus, opt-in, a local .env file for development — with
+// explicit, non-reflective calls and fail-fast, aggregated validation.
+//
+// There is no struct-tag parsing and no reflection: every configuration
+// value is read by a plain function call (l.mustString("PORT"), and so
+// on), so grepping for a variable name in this package always finds
+// exactly where it's read and how it's validated. See config.go.tmpl for
+// the pattern a generated project extends with its own fields.
+package config
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// loader accumulates every config problem found during a single Load()
+// call rather than stopping at the first one, so a developer fixing
+// broken config sees every missing or invalid variable in one run instead
+// of discovering them one at a time across repeated restarts.
+type loader struct {
+	errs []error
+}
+
+// mustString requires key to be set to a non-empty value. Missing or
+// empty appends an error and returns "".
+func (l *loader) mustString(key string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		l.errs = append(l.errs, fmt.Errorf("%s is required", key))
+		return ""
+	}
+	return v
+}
+
+// getString returns the value of key, or def if key is unset or empty.
+func (l *loader) getString(key, def string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+// mustInt requires key to be set to a valid integer. Missing, empty, or
+// failing strconv.Atoi appends an error naming the key and the invalid
+// value, and returns 0.
+func (l *loader) mustInt(key string) int {
+	v := os.Getenv(key)
+	if v == "" {
+		l.errs = append(l.errs, fmt.Errorf("%s is required", key))
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		l.errs = append(l.errs, fmt.Errorf("%s: invalid integer %q", key, v))
+		return 0
+	}
+	return n
+}
+
+// getInt returns key parsed as an integer, or def if key is genuinely
+// unset. This is "optional with a default," not "best-effort, ignore
+// errors": a present-but-invalid value (set, non-empty, but not
+// parseable) still appends an error rather than silently falling back to
+// def. def only applies when the variable is truly absent.
+func (l *loader) getInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		l.errs = append(l.errs, fmt.Errorf("%s: invalid integer %q", key, v))
+		return def
+	}
+	return n
+}
+
+// mustBool requires key to be set to a valid strconv.ParseBool value.
+func (l *loader) mustBool(key string) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		l.errs = append(l.errs, fmt.Errorf("%s is required", key))
+		return false
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		l.errs = append(l.errs, fmt.Errorf("%s: invalid bool %q", key, v))
+		return false
+	}
+	return b
+}
+
+// getBool returns key parsed as a bool, or def if key is genuinely unset.
+// Same "optional with a default, not best-effort" contract as getInt.
+func (l *loader) getBool(key string, def bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		l.errs = append(l.errs, fmt.Errorf("%s: invalid bool %q", key, v))
+		return def
+	}
+	return b
+}
+
+// mustDuration requires key to be set to a valid time.ParseDuration
+// string.
+func (l *loader) mustDuration(key string) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		l.errs = append(l.errs, fmt.Errorf("%s is required", key))
+		return 0
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		l.errs = append(l.errs, fmt.Errorf("%s: invalid duration %q", key, v))
+		return 0
+	}
+	return d
+}
+
+// getDuration returns key parsed as a time.Duration, or def if key is
+// genuinely unset. Same "optional with a default, not best-effort"
+// contract as getInt.
+func (l *loader) getDuration(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		l.errs = append(l.errs, fmt.Errorf("%s: invalid duration %q", key, v))
+		return def
+	}
+	return d
+}
+
+// oneOf validates that value is one of allowed, appending an error naming
+// the invalid value and the full allowed set if not. Used for things like
+// ENVIRONMENT being one of development, staging, production.
+func (l *loader) oneOf(key, value string, allowed ...string) string {
+	for _, a := range allowed {
+		if value == a {
+			return value
+		}
+	}
+	l.errs = append(l.errs, fmt.Errorf("%s: %q is not one of %s", key, value, strings.Join(allowed, ", ")))
+	return value
+}
+
+// require is a general-purpose structural check that doesn't fit the
+// key-based helpers above — e.g. a port range that depends on an already
+// -parsed value rather than a single raw environment variable. It appends
+// msg as an error if cond is false.
+func (l *loader) require(cond bool, msg string) {
+	if !cond {
+		l.errs = append(l.errs, errors.New(msg))
+	}
+}
+
+// err returns nil if no errors were accumulated, otherwise a single
+// combined error (errors.Join) naming every problem found during this
+// loader's lifetime.
+func (l *loader) err() error {
+	return errors.Join(l.errs...)
+}
