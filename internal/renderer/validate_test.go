@@ -26,7 +26,7 @@ func TestValidatePlanOK(t *testing.T) {
 		},
 	}
 
-	tasks, deps, err := validatePlan(planOf(m))
+	tasks, deps, envVars, err := validatePlan(planOf(m))
 	if err != nil {
 		t.Fatalf("validatePlan: %v", err)
 	}
@@ -35,6 +35,9 @@ func TestValidatePlanOK(t *testing.T) {
 	}
 	if len(deps) != 1 || deps[0].module != "github.com/redis/go-redis/v9" || deps[0].version != "v9.5.1" {
 		t.Fatalf("deps = %+v", deps)
+	}
+	if len(envVars) != 0 {
+		t.Fatalf("envVars = %+v, want none (m declares no env vars)", envVars)
 	}
 }
 
@@ -52,7 +55,7 @@ func TestValidatePlanPathEscapeDefenseInDepth(t *testing.T) {
 		},
 	}
 
-	_, _, err := validatePlan(planOf(m))
+	_, _, _, err := validatePlan(planOf(m))
 	renderErr, ok := err.(*RenderError)
 	if !ok {
 		t.Fatalf("validatePlan() error = %v (%T), want *RenderError", err, err)
@@ -99,7 +102,7 @@ func TestValidatePlanDuplicateOutputPath(t *testing.T) {
 		"go": {Templates: []manifest.Template{{From: "y.tmpl", To: "internal/shared.go"}}},
 	}}
 
-	_, _, err := validatePlan(planOf(a, b))
+	_, _, _, err := validatePlan(planOf(a, b))
 	renderErr, ok := err.(*RenderError)
 	if !ok {
 		t.Fatalf("validatePlan() error = %v (%T), want *RenderError", err, err)
@@ -121,7 +124,7 @@ func TestValidatePlanDependencyConflict(t *testing.T) {
 		"go": {Dependencies: []manifest.Dependency{{Module: "github.com/x/y", Version: "v2.0.0"}}},
 	}}
 
-	_, _, err := validatePlan(planOf(a, b))
+	_, _, _, err := validatePlan(planOf(a, b))
 	renderErr, ok := err.(*RenderError)
 	if !ok {
 		t.Fatalf("validatePlan() error = %v (%T), want *RenderError", err, err)
@@ -143,11 +146,107 @@ func TestValidatePlanSameVersionDedupesSilently(t *testing.T) {
 		"go": {Dependencies: []manifest.Dependency{{Module: "github.com/x/y", Version: "v1.0.0"}}},
 	}}
 
-	_, deps, err := validatePlan(planOf(a, b))
+	_, deps, _, err := validatePlan(planOf(a, b))
 	if err != nil {
 		t.Fatalf("validatePlan: %v", err)
 	}
 	if len(deps) != 1 {
 		t.Fatalf("deps = %+v, want exactly one merged entry", deps)
+	}
+}
+
+func TestValidatePlanEnvVarsDistinctBothCollected(t *testing.T) {
+	a := &manifest.Manifest{
+		Name:      "a",
+		EnvVars:   []manifest.EnvVar{{Name: "DATABASE_URL", Description: "d", Required: true}},
+		Languages: map[string]manifest.Language{"go": {}},
+	}
+	b := &manifest.Manifest{
+		Name:      "b",
+		EnvVars:   []manifest.EnvVar{{Name: "REDIS_URL", Description: "r", Required: true}},
+		Languages: map[string]manifest.Language{"go": {}},
+	}
+
+	_, _, envVars, err := validatePlan(planOf(a, b))
+	if err != nil {
+		t.Fatalf("validatePlan: %v", err)
+	}
+	if len(envVars) != 2 {
+		t.Fatalf("envVars = %+v, want 2 distinct entries", envVars)
+	}
+}
+
+func TestValidatePlanEnvVarsIdenticalDedupesSilently(t *testing.T) {
+	a := &manifest.Manifest{
+		Name:      "a",
+		EnvVars:   []manifest.EnvVar{{Name: "REDIS_URL", Description: "for idempotency", Required: true}},
+		Languages: map[string]manifest.Language{"go": {}},
+	}
+	b := &manifest.Manifest{
+		Name: "b",
+		// Same Name/Required/Default as a's — only Description differs,
+		// which is just prose and must not trigger a conflict.
+		EnvVars:   []manifest.EnvVar{{Name: "REDIS_URL", Description: "for rate limiting", Required: true}},
+		Languages: map[string]manifest.Language{"go": {}},
+	}
+
+	_, _, envVars, err := validatePlan(planOf(a, b))
+	if err != nil {
+		t.Fatalf("validatePlan: %v", err)
+	}
+	if len(envVars) != 1 {
+		t.Fatalf("envVars = %+v, want exactly one merged entry", envVars)
+	}
+}
+
+func TestValidatePlanEnvVarConflictDifferentRequired(t *testing.T) {
+	a := &manifest.Manifest{
+		Name:      "a",
+		EnvVars:   []manifest.EnvVar{{Name: "PORT", Description: "d", Required: true}},
+		Languages: map[string]manifest.Language{"go": {}},
+	}
+	b := &manifest.Manifest{
+		Name:      "b",
+		EnvVars:   []manifest.EnvVar{{Name: "PORT", Description: "d", Required: false, Default: "8080"}},
+		Languages: map[string]manifest.Language{"go": {}},
+	}
+
+	_, _, _, err := validatePlan(planOf(a, b))
+	renderErr, ok := err.(*RenderError)
+	if !ok {
+		t.Fatalf("validatePlan() error = %v (%T), want *RenderError", err, err)
+	}
+	if len(renderErr.EnvVarConflicts) != 1 {
+		t.Fatalf("EnvVarConflicts = %+v, want 1", renderErr.EnvVarConflicts)
+	}
+	ec := renderErr.EnvVarConflicts[0]
+	if ec.Name != "PORT" || ec.ModuleA != "a" || !ec.RequiredA || ec.ModuleB != "b" || ec.RequiredB {
+		t.Fatalf("EnvVarConflictError = %+v", ec)
+	}
+}
+
+func TestValidatePlanEnvVarConflictDifferentDefault(t *testing.T) {
+	a := &manifest.Manifest{
+		Name:      "a",
+		EnvVars:   []manifest.EnvVar{{Name: "PORT", Description: "d", Required: false, Default: "8080"}},
+		Languages: map[string]manifest.Language{"go": {}},
+	}
+	b := &manifest.Manifest{
+		Name:      "b",
+		EnvVars:   []manifest.EnvVar{{Name: "PORT", Description: "d", Required: false, Default: "3000"}},
+		Languages: map[string]manifest.Language{"go": {}},
+	}
+
+	_, _, _, err := validatePlan(planOf(a, b))
+	renderErr, ok := err.(*RenderError)
+	if !ok {
+		t.Fatalf("validatePlan() error = %v (%T), want *RenderError", err, err)
+	}
+	if len(renderErr.EnvVarConflicts) != 1 {
+		t.Fatalf("EnvVarConflicts = %+v, want 1", renderErr.EnvVarConflicts)
+	}
+	ec := renderErr.EnvVarConflicts[0]
+	if ec.Name != "PORT" || ec.ModuleA != "a" || ec.DefaultA != "8080" || ec.ModuleB != "b" || ec.DefaultB != "3000" {
+		t.Fatalf("EnvVarConflictError = %+v", ec)
 	}
 }
