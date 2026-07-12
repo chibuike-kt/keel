@@ -51,8 +51,8 @@ func TestResolveProjectMissingBaseErrors(t *testing.T) {
 	c := catalog(mod("idempotency"))
 
 	_, err := ResolveProject(c, []string{"idempotency"}, "go")
-	if err == nil {
-		t.Fatal(`ResolveProject() error = nil, want an error when the catalog has no "base" module`)
+	if !errors.Is(err, ErrMissingBaseModule) {
+		t.Fatalf("ResolveProject() error = %v, want errors.Is(err, ErrMissingBaseModule)", err)
 	}
 }
 
