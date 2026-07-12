@@ -7,6 +7,11 @@ tags: [reliability, payments]
 requires: []
 conflicts: []
 
+env:
+  - name: REDIS_URL
+    description: Redis connection string used to store idempotency keys.
+    required: true
+
 languages:
   go:
     dependencies:

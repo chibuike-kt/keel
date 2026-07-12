@@ -7,6 +7,16 @@ tags: [reliability]
 requires: []
 conflicts: []
 
+env:
+  - name: PORT
+    description: HTTP server port.
+    required: false
+    default: "8080"
+  - name: ENVIRONMENT
+    description: Deployment environment name (e.g. development, staging, production).
+    required: false
+    default: development
+
 languages:
   go:
     templates:
