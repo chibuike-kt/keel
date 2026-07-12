@@ -6,9 +6,11 @@
 package e2e
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -55,7 +57,11 @@ func renderProject(t *testing.T, plan *resolver.Plan) string {
 	ctx := renderer.Context{
 		ProjectName: "myapp",
 		ModulePath:  "example.com/myapp",
-		GoVersion:   "1.26",
+		// Pinned to the toolchain actually running this test, not a
+		// hardcoded literal: a generated go.mod's go directive newer
+		// than the local/CI toolchain forces an offline toolchain
+		// download that would fail the subsequent go build below.
+		GoVersion: strings.TrimPrefix(runtime.Version(), "go"),
 	}
 	if err := r.Render(plan, ctx, targetDir); err != nil {
 		t.Fatalf("Render: %v", err)
@@ -134,11 +140,12 @@ func TestWebhookEnvVarsInEnvExample(t *testing.T) {
 		"FLUTTERWAVE_SECRET_HASH",
 		"NOMBA_SECRET_KEY",
 	} {
-		if !strings.Contains(content, name+"=") {
-			t.Errorf(".env.example missing %s:\n%s", name, content)
-		}
-		if !strings.Contains(content, "# Optional") {
-			t.Errorf(".env.example entries should be optional, got:\n%s", content)
+		// Exact block, not a loose substring check: ties the "# Optional"
+		// marker to this specific var, so one var wrongly marked required
+		// can't hide behind the other three still being optional.
+		want := fmt.Sprintf("# Optional (default: )\n%s=\n", name)
+		if !strings.Contains(content, want) {
+			t.Errorf(".env.example missing expected optional entry for %s (want %q):\n%s", name, want, content)
 		}
 	}
 }
