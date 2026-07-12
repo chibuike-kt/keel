@@ -1,0 +1,48 @@
+package logging
+
+import (
+	"bytes"
+	"context"
+	"encoding/hex"
+	"log/slog"
+	"testing"
+)
+
+func TestWithLoggerFromContextRoundTrip(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	ctx := WithLogger(context.Background(), logger)
+	got := FromContext(ctx)
+
+	got.Info("hello")
+	if buf.Len() == 0 {
+		t.Fatal("FromContext did not return the logger stored by WithLogger (nothing was written to its handler)")
+	}
+}
+
+func TestFromContextOnEmptyContextReturnsUsableLogger(t *testing.T) {
+	logger := FromContext(context.Background())
+	if logger == nil {
+		t.Fatal("FromContext(context.Background()) = nil, want a non-nil, usable logger")
+	}
+	// Must not panic when actually used.
+	logger.Info("this must not panic")
+}
+
+func TestNewRequestIDIsDistinctAnd32HexChars(t *testing.T) {
+	seen := make(map[string]bool)
+	for i := 0; i < 100; i++ {
+		id := NewRequestID()
+		if len(id) != 32 {
+			t.Fatalf("len(NewRequestID()) = %d, want 32", len(id))
+		}
+		if _, err := hex.DecodeString(id); err != nil {
+			t.Fatalf("NewRequestID() = %q is not valid hex: %v", id, err)
+		}
+		if seen[id] {
+			t.Fatalf("NewRequestID() produced a duplicate: %q", id)
+		}
+		seen[id] = true
+	}
+}

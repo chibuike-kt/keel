@@ -1,0 +1,69 @@
+package logging
+
+import (
+	"log/slog"
+	"net/http"
+	"time"
+)
+
+// Middleware returns HTTP middleware that assigns each request a
+// correlation ID and a request-scoped logger carrying it, then logs one
+// line summarizing the request after it completes.
+//
+// It honors an upstream X-Request-ID header when present and non-empty —
+// so a trace started by a gateway or another service in front of this one
+// survives across the boundary — and generates a fresh ID with
+// NewRequestID otherwise. Either way, the ID is echoed back on the
+// response's X-Request-ID header so the client can correlate too.
+func Middleware(base *slog.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requestID := r.Header.Get("X-Request-ID")
+			if requestID == "" {
+				requestID = NewRequestID()
+			}
+			w.Header().Set("X-Request-ID", requestID)
+
+			logger := base.With("request_id", requestID)
+			r = r.WithContext(WithLogger(r.Context(), logger))
+
+			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+			start := time.Now()
+			next.ServeHTTP(rec, r)
+			duration := time.Since(start)
+
+			logger.Info("request completed",
+				"method", r.Method,
+				"path", r.URL.Path,
+				"status", rec.status,
+				slog.Duration("duration", duration),
+			)
+		})
+	}
+}
+
+// statusRecorder captures a handler's final status code. Same
+// response-recorder shape as idempotency's and security's middleware: an
+// embedded http.ResponseWriter with WriteHeader overridden to note the
+// status before delegating to the real write.
+type statusRecorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	if r.wroteHeader {
+		return
+	}
+	r.wroteHeader = true
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if !r.wroteHeader {
+		r.WriteHeader(http.StatusOK)
+	}
+	return r.ResponseWriter.Write(b)
+}

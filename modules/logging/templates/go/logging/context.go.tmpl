@@ -1,0 +1,53 @@
+package logging
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"log/slog"
+)
+
+// contextKey is an unexported, unique type — the safe pattern for context
+// keys used throughout this repository, so a value stored under it can
+// never collide with a key some other package defines.
+type contextKey struct{}
+
+// WithLogger returns a copy of ctx carrying l, retrievable later with
+// FromContext.
+func WithLogger(ctx context.Context, l *slog.Logger) context.Context {
+	return context.WithValue(ctx, contextKey{}, l)
+}
+
+// FromContext returns the logger stored in ctx by WithLogger, or
+// slog.Default() if none is present. It never returns nil: a caller doing
+// logging.FromContext(ctx).Info(...) must not panic just because the
+// middleware wasn't wired into this particular code path — a background
+// job, a CLI command, anything outside the HTTP request lifecycle that
+// still wants to log through this package. slog.Default() is the sane
+// fallback here rather than a discard-output logger: a caller still wants
+// to see these log lines somewhere, and silently swallowing them would
+// hide exactly the code paths that most need the fallback noticed and
+// fixed by wiring a request-scoped logger in properly.
+func FromContext(ctx context.Context) *slog.Logger {
+	if l, ok := ctx.Value(contextKey{}).(*slog.Logger); ok {
+		return l
+	}
+	return slog.Default()
+}
+
+// NewRequestID generates a random request identifier: 16 bytes from
+// crypto/rand, hex-encoded to 32 hex characters. No new dependency here —
+// the same reasoning as the idempotency module using a content hash
+// instead of a UUID library: this repository doesn't pull in google/uuid
+// for something crypto/rand and encoding/hex already do.
+func NewRequestID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand.Read does not fail in practice on any supported
+		// platform. If it does, the platform's entropy source is broken,
+		// which is a far more serious problem than this function could
+		// meaningfully recover from by returning a zero-value ID instead.
+		panic("logging: crypto/rand unavailable: " + err.Error())
+	}
+	return hex.EncodeToString(b)
+}
