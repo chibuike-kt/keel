@@ -1,0 +1,316 @@
+package config
+
+import (
+	"errors"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestLoaderMustString(t *testing.T) {
+	t.Run("present", func(t *testing.T) {
+		t.Setenv("K", "value")
+		l := &loader{}
+		if got := l.mustString("K"); got != "value" {
+			t.Fatalf("mustString() = %q, want %q", got, "value")
+		}
+		if l.err() != nil {
+			t.Fatalf("err() = %v, want nil", l.err())
+		}
+	})
+
+	t.Run("absent", func(t *testing.T) {
+		l := &loader{}
+		if got := l.mustString("MISSING_KEY_XYZ"); got != "" {
+			t.Fatalf("mustString() = %q, want empty", got)
+		}
+		if l.err() == nil {
+			t.Fatal("err() = nil, want an error for a missing required string")
+		}
+	})
+}
+
+func TestLoaderGetString(t *testing.T) {
+	t.Run("present", func(t *testing.T) {
+		t.Setenv("K", "value")
+		l := &loader{}
+		if got := l.getString("K", "default"); got != "value" {
+			t.Fatalf("getString() = %q, want %q", got, "value")
+		}
+	})
+
+	t.Run("absent uses default", func(t *testing.T) {
+		l := &loader{}
+		if got := l.getString("MISSING_KEY_XYZ", "default"); got != "default" {
+			t.Fatalf("getString() = %q, want %q", got, "default")
+		}
+		if l.err() != nil {
+			t.Fatalf("err() = %v, want nil", l.err())
+		}
+	})
+}
+
+func TestLoaderMustInt(t *testing.T) {
+	t.Run("present valid", func(t *testing.T) {
+		t.Setenv("K", "42")
+		l := &loader{}
+		if got := l.mustInt("K"); got != 42 {
+			t.Fatalf("mustInt() = %d, want 42", got)
+		}
+		if l.err() != nil {
+			t.Fatalf("err() = %v, want nil", l.err())
+		}
+	})
+
+	t.Run("present invalid", func(t *testing.T) {
+		t.Setenv("K", "not-a-number")
+		l := &loader{}
+		l.mustInt("K")
+		if l.err() == nil {
+			t.Fatal("err() = nil, want an error for an invalid integer")
+		}
+		if !strings.Contains(l.err().Error(), "K") || !strings.Contains(l.err().Error(), "not-a-number") {
+			t.Fatalf("err() = %v, want it to name the key and the invalid value", l.err())
+		}
+	})
+
+	t.Run("absent required", func(t *testing.T) {
+		l := &loader{}
+		l.mustInt("MISSING_KEY_XYZ")
+		if l.err() == nil {
+			t.Fatal("err() = nil, want an error for a missing required int")
+		}
+	})
+}
+
+func TestLoaderGetInt(t *testing.T) {
+	t.Run("present valid", func(t *testing.T) {
+		t.Setenv("K", "42")
+		l := &loader{}
+		if got := l.getInt("K", 7); got != 42 {
+			t.Fatalf("getInt() = %d, want 42", got)
+		}
+	})
+
+	t.Run("present invalid still errors", func(t *testing.T) {
+		// getInt is "optional with a default," not "best-effort, ignore
+		// errors": a present-but-invalid value must still error, not
+		// silently fall back to def.
+		t.Setenv("K", "not-a-number")
+		l := &loader{}
+		l.getInt("K", 7)
+		if l.err() == nil {
+			t.Fatal("err() = nil, want an error for a present-but-invalid int")
+		}
+	})
+
+	t.Run("absent uses default", func(t *testing.T) {
+		l := &loader{}
+		if got := l.getInt("MISSING_KEY_XYZ", 7); got != 7 {
+			t.Fatalf("getInt() = %d, want default 7", got)
+		}
+		if l.err() != nil {
+			t.Fatalf("err() = %v, want nil", l.err())
+		}
+	})
+}
+
+func TestLoaderMustBool(t *testing.T) {
+	t.Run("present valid", func(t *testing.T) {
+		t.Setenv("K", "true")
+		l := &loader{}
+		if got := l.mustBool("K"); got != true {
+			t.Fatalf("mustBool() = %v, want true", got)
+		}
+	})
+
+	t.Run("present invalid", func(t *testing.T) {
+		t.Setenv("K", "not-a-bool")
+		l := &loader{}
+		l.mustBool("K")
+		if l.err() == nil {
+			t.Fatal("err() = nil, want an error for an invalid bool")
+		}
+	})
+
+	t.Run("absent required", func(t *testing.T) {
+		l := &loader{}
+		l.mustBool("MISSING_KEY_XYZ")
+		if l.err() == nil {
+			t.Fatal("err() = nil, want an error for a missing required bool")
+		}
+	})
+}
+
+func TestLoaderGetBool(t *testing.T) {
+	t.Run("present valid", func(t *testing.T) {
+		t.Setenv("K", "false")
+		l := &loader{}
+		if got := l.getBool("K", true); got != false {
+			t.Fatalf("getBool() = %v, want false", got)
+		}
+	})
+
+	t.Run("present invalid still errors", func(t *testing.T) {
+		t.Setenv("K", "not-a-bool")
+		l := &loader{}
+		l.getBool("K", true)
+		if l.err() == nil {
+			t.Fatal("err() = nil, want an error for a present-but-invalid bool")
+		}
+	})
+
+	t.Run("absent uses default", func(t *testing.T) {
+		l := &loader{}
+		if got := l.getBool("MISSING_KEY_XYZ", true); got != true {
+			t.Fatalf("getBool() = %v, want default true", got)
+		}
+		if l.err() != nil {
+			t.Fatalf("err() = %v, want nil", l.err())
+		}
+	})
+}
+
+func TestLoaderMustDuration(t *testing.T) {
+	t.Run("present valid", func(t *testing.T) {
+		t.Setenv("K", "30s")
+		l := &loader{}
+		if got := l.mustDuration("K"); got != 30*time.Second {
+			t.Fatalf("mustDuration() = %v, want %v", got, 30*time.Second)
+		}
+	})
+
+	t.Run("present invalid", func(t *testing.T) {
+		t.Setenv("K", "not-a-duration")
+		l := &loader{}
+		l.mustDuration("K")
+		if l.err() == nil {
+			t.Fatal("err() = nil, want an error for an invalid duration")
+		}
+	})
+
+	t.Run("absent required", func(t *testing.T) {
+		l := &loader{}
+		l.mustDuration("MISSING_KEY_XYZ")
+		if l.err() == nil {
+			t.Fatal("err() = nil, want an error for a missing required duration")
+		}
+	})
+}
+
+func TestLoaderGetDuration(t *testing.T) {
+	t.Run("present valid", func(t *testing.T) {
+		t.Setenv("K", "1m")
+		l := &loader{}
+		if got := l.getDuration("K", 5*time.Second); got != time.Minute {
+			t.Fatalf("getDuration() = %v, want %v", got, time.Minute)
+		}
+	})
+
+	t.Run("present invalid still errors", func(t *testing.T) {
+		t.Setenv("K", "not-a-duration")
+		l := &loader{}
+		l.getDuration("K", 5*time.Second)
+		if l.err() == nil {
+			t.Fatal("err() = nil, want an error for a present-but-invalid duration")
+		}
+	})
+
+	t.Run("absent uses default", func(t *testing.T) {
+		l := &loader{}
+		if got := l.getDuration("MISSING_KEY_XYZ", 5*time.Second); got != 5*time.Second {
+			t.Fatalf("getDuration() = %v, want default %v", got, 5*time.Second)
+		}
+		if l.err() != nil {
+			t.Fatalf("err() = %v, want nil", l.err())
+		}
+	})
+}
+
+func TestLoaderOneOf(t *testing.T) {
+	t.Run("valid passes through", func(t *testing.T) {
+		l := &loader{}
+		got := l.oneOf("ENVIRONMENT", "staging", "development", "staging", "production")
+		if got != "staging" {
+			t.Fatalf("oneOf() = %q, want %q", got, "staging")
+		}
+		if l.err() != nil {
+			t.Fatalf("err() = %v, want nil", l.err())
+		}
+	})
+
+	t.Run("invalid errors naming the allowed set", func(t *testing.T) {
+		l := &loader{}
+		l.oneOf("ENVIRONMENT", "bogus", "development", "staging", "production")
+		if l.err() == nil {
+			t.Fatal("err() = nil, want an error for a value outside the allowed set")
+		}
+		msg := l.err().Error()
+		for _, want := range []string{"bogus", "development", "staging", "production"} {
+			if !strings.Contains(msg, want) {
+				t.Fatalf("err() = %q, want it to contain %q", msg, want)
+			}
+		}
+	})
+}
+
+func TestLoaderRequire(t *testing.T) {
+	t.Run("true passes silently", func(t *testing.T) {
+		l := &loader{}
+		l.require(true, "should not appear")
+		if l.err() != nil {
+			t.Fatalf("err() = %v, want nil", l.err())
+		}
+	})
+
+	t.Run("false appends message", func(t *testing.T) {
+		l := &loader{}
+		l.require(false, "port out of range")
+		if l.err() == nil {
+			t.Fatal("err() = nil, want an error")
+		}
+		if !strings.Contains(l.err().Error(), "port out of range") {
+			t.Fatalf("err() = %q, want it to contain the given message", l.err().Error())
+		}
+	})
+}
+
+func TestLoaderErrAggregatesAllProblems(t *testing.T) {
+	l := &loader{}
+	l.mustString("MISSING_A")
+	l.mustInt("MISSING_B")
+	l.require(false, "custom problem")
+
+	err := l.err()
+	if err == nil {
+		t.Fatal("err() = nil, want a combined error for three accumulated problems")
+	}
+
+	// This is the test that actually proves aggregation, not just
+	// documents the intent: all three problems must be visible in the
+	// single returned error, not just the first one encountered.
+	msg := err.Error()
+	for _, want := range []string{"MISSING_A", "MISSING_B", "custom problem"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("combined error = %q, want it to mention %q", msg, want)
+		}
+	}
+
+	// errors.Join's result implements Unwrap() []error — confirm the tree
+	// actually contains three distinct errors, not one formatted string
+	// that happens to contain the right substrings.
+	var joined interface{ Unwrap() []error }
+	if !errors.As(err, &joined) {
+		t.Fatal("combined error does not implement Unwrap() []error — want errors.Join's aggregation, not a single formatted string")
+	}
+	if got := len(joined.Unwrap()); got != 3 {
+		t.Fatalf("combined error unwraps to %d errors, want 3", got)
+	}
+}
+
+func TestLoaderErrNilWhenNoProblems(t *testing.T) {
+	l := &loader{}
+	if err := l.err(); err != nil {
+		t.Fatalf("err() = %v, want nil", err)
+	}
+}

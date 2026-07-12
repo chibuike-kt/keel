@@ -1,0 +1,24 @@
+apiVersion: keel/v1
+name: config
+version: 0.1.0
+summary: "Explicit, non-reflective environment config loading with fail-fast aggregated validation."
+tags: [reliability]
+
+requires: []
+conflicts: []
+
+languages:
+  go:
+    templates:
+      - from: templates/go/config/loader.go.tmpl
+        to: internal/config/loader.go
+      - from: templates/go/config/dotenv.go.tmpl
+        to: internal/config/dotenv.go
+      - from: templates/go/config/config.go.tmpl
+        to: internal/config/config.go
+      - from: templates/go/config/loader_test.go.tmpl
+        to: internal/config/loader_test.go
+      - from: templates/go/config/dotenv_test.go.tmpl
+        to: internal/config/dotenv_test.go
+      - from: templates/go/config/config_test.go.tmpl
+        to: internal/config/config_test.go

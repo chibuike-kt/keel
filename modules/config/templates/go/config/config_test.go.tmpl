@@ -1,0 +1,105 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestLoadAllValid(t *testing.T) {
+	t.Setenv("ENVIRONMENT", "production")
+	t.Setenv("PORT", "9090")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Environment != Production {
+		t.Fatalf("Environment = %q, want %q", cfg.Environment, Production)
+	}
+	if cfg.Port != 9090 {
+		t.Fatalf("Port = %d, want 9090", cfg.Port)
+	}
+}
+
+func TestLoadMultipleProblemsAggregated(t *testing.T) {
+	t.Setenv("ENVIRONMENT", "not-a-real-environment")
+	t.Setenv("PORT", "not-a-number")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() error = nil, want an error for two invalid variables")
+	}
+
+	// The end-to-end proof of the aggregation behavior tested at the
+	// loader level: both problems must be visible in Load's single
+	// returned error, not just the first one encountered.
+	msg := err.Error()
+	if !strings.Contains(msg, "ENVIRONMENT") {
+		t.Fatalf("Load() error = %q, want it to mention ENVIRONMENT", msg)
+	}
+	if !strings.Contains(msg, "PORT") {
+		t.Fatalf("Load() error = %q, want it to ALSO mention PORT, not just ENVIRONMENT", msg)
+	}
+}
+
+func TestLoadPortDefaultsWhenUnset(t *testing.T) {
+	t.Setenv("ENVIRONMENT", "development")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Port != 8080 {
+		t.Fatalf("Port = %d, want default 8080", cfg.Port)
+	}
+}
+
+func TestLoadPortInvalidDoesNotSilentlyDefault(t *testing.T) {
+	// Proves getInt's "invalid still errors, only unset gets the default"
+	// distinction at the Load level, not just inside loader's own tests.
+	t.Setenv("ENVIRONMENT", "development")
+	t.Setenv("PORT", "not-a-number")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() error = nil, want an error for a non-numeric PORT")
+	}
+	if !strings.Contains(err.Error(), "PORT") {
+		t.Fatalf("Load() error = %q, want it to mention PORT", err.Error())
+	}
+}
+
+func TestLoadPortOutOfRange(t *testing.T) {
+	for _, port := range []string{"0", "99999"} {
+		t.Run(port, func(t *testing.T) {
+			t.Setenv("ENVIRONMENT", "development")
+			t.Setenv("PORT", port)
+
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("Load() error = nil, want an error for out-of-range PORT %q", port)
+			}
+		})
+	}
+}
+
+func TestLoadWithDotEnv(t *testing.T) {
+	t.Cleanup(func() { os.Unsetenv("PORT") })
+	t.Setenv("ENVIRONMENT", "development")
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	if err := os.WriteFile(path, []byte("PORT=9999\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg, err := Load(WithDotEnv(path))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Port != 9999 {
+		t.Fatalf("Port = %d, want 9999 (from the .env file)", cfg.Port)
+	}
+}

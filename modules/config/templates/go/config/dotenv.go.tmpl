@@ -1,0 +1,93 @@
+package config
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+)
+
+// parseDotEnv reads a minimal .env file: one KEY=VALUE pair per line,
+// blank lines and lines starting with # ignored. There is no support for
+// multi-line values, no `export` prefix, no variable interpolation, and no
+// quote handling beyond trimming a single pair of surrounding double
+// quotes if present.
+//
+// This is intentionally minimal, not a full godotenv-compatible parser. A
+// project that needs more — multi-line values, $VAR-style interpolation,
+// and so on — should add a real dependency for that rather than expect
+// this function to grow those features over time.
+//
+// A malformed line — anything with no '=' — is a real error: a broken
+// .env file should fail loudly, not be silently skipped, since a silently
+// skipped line is a silently missing config value.
+func parseDotEnv(r io.Reader) (map[string]string, error) {
+	values := make(map[string]string)
+
+	scanner := bufio.NewScanner(r)
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			return nil, fmt.Errorf("dotenv: line %d: missing '=': %q", lineNum, line)
+		}
+
+		values[strings.TrimSpace(key)] = unquote(strings.TrimSpace(value))
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("dotenv: %w", err)
+	}
+	return values, nil
+}
+
+// unquote strips one pair of surrounding double quotes from s, if present.
+// It does not interpret escape sequences inside them — this parser's
+// quote handling is limited to that trim, nothing more.
+func unquote(s string) string {
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+// loadDotEnv reads path and calls os.Setenv for each parsed key — but only
+// if that key is not already set in the real environment. Real
+// environment variables always win over .env file contents; this is what
+// makes it safe to have a stray .env file present without it silently
+// overriding a production container's real configuration.
+//
+// A missing file at path is not an error — a fresh clone without a local
+// .env file is a completely normal state, not a misconfiguration. Only a
+// malformed (present but unparseable) file is an error.
+func loadDotEnv(path string) error {
+	f, err := os.Open(path) //nolint:gosec // path is a caller-supplied dotenv location, not untrusted input
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("dotenv: %w", err)
+	}
+	defer f.Close()
+
+	values, err := parseDotEnv(f)
+	if err != nil {
+		return err
+	}
+
+	for key, value := range values {
+		if _, ok := os.LookupEnv(key); ok {
+			continue
+		}
+		if err := os.Setenv(key, value); err != nil {
+			return fmt.Errorf("dotenv: setting %s: %w", key, err)
+		}
+	}
+	return nil
+}
