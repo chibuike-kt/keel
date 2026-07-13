@@ -20,6 +20,10 @@ Flags:
 // Run executes the keel CLI with the given arguments, writing normal output to
 // out and diagnostics to errOut. It returns the process exit code.
 func Run(args []string, out, errOut io.Writer) int {
+	if len(args) > 0 && args[0] == "init" {
+		return cmdInit(args[1:], out, errOut)
+	}
+
 	fs := flag.NewFlagSet("keel", flag.ContinueOnError)
 	fs.SetOutput(errOut)
 
