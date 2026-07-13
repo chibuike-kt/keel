@@ -1,0 +1,147 @@
+package observability
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+)
+
+func TestPrometheusRegistryMetricsScrapeCorrectly(t *testing.T) {
+	reg := NewPrometheusRegistry()
+
+	counter := reg.NewCounter("test_requests_total", "total requests")
+	counter.Add(3)
+
+	gauge := reg.NewGauge("test_inflight", "in-flight requests")
+	gauge.Set(5)
+	gauge.Inc() // 6
+	gauge.Dec() // 5
+	gauge.Dec() // 4
+
+	histogram := reg.NewHistogram("test_latency_seconds", "latency", []float64{1, 5, 10})
+	histogram.Observe(2) // <= 5, <= 10
+	histogram.Observe(7) // <= 10 only
+
+	// Scraped via the real Handler() over an actual HTTP round trip, and
+	// parsed as real Prometheus exposition text (testutil.ScrapeAndCompare
+	// does the parsing) — not just "the calls didn't return an error."
+	server := httptest.NewServer(reg.Handler())
+	defer server.Close()
+
+	t.Run("counter", func(t *testing.T) {
+		want := `
+# HELP test_requests_total total requests
+# TYPE test_requests_total counter
+test_requests_total 3
+`
+		if err := testutil.ScrapeAndCompare(server.URL, strings.NewReader(want), "test_requests_total"); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("gauge", func(t *testing.T) {
+		want := `
+# HELP test_inflight in-flight requests
+# TYPE test_inflight gauge
+test_inflight 4
+`
+		if err := testutil.ScrapeAndCompare(server.URL, strings.NewReader(want), "test_inflight"); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("histogram", func(t *testing.T) {
+		want := `
+# HELP test_latency_seconds latency
+# TYPE test_latency_seconds histogram
+test_latency_seconds_bucket{le="1"} 0
+test_latency_seconds_bucket{le="5"} 1
+test_latency_seconds_bucket{le="10"} 2
+test_latency_seconds_bucket{le="+Inf"} 2
+test_latency_seconds_sum 9
+test_latency_seconds_count 2
+`
+		if err := testutil.ScrapeAndCompare(server.URL, strings.NewReader(want), "test_latency_seconds"); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+// TestPrometheusRegistryHandlerExcludesGlobalDefaultRegistry is the test
+// that actually proves "non-global registry" is real, not just a
+// comment: it registers directly against prometheus's package-level
+// default registerer — exactly the footgun PrometheusRegistry exists to
+// avoid — and requires that metric NOT appear in an unrelated
+// PrometheusRegistry's own scrape output.
+func TestPrometheusRegistryHandlerExcludesGlobalDefaultRegistry(t *testing.T) {
+	global := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "global_leak_test_total",
+		Help: "registered directly against the global default registerer",
+	})
+	prometheus.MustRegister(global)
+	defer prometheus.Unregister(global)
+	global.Inc()
+
+	reg := NewPrometheusRegistry()
+	server := httptest.NewServer(reg.Handler())
+	defer server.Close()
+
+	body := scrape(t, server.URL)
+	if strings.Contains(body, "global_leak_test_total") {
+		t.Fatalf("Handler() output contains a metric registered against the global default registerer:\n%s", body)
+	}
+}
+
+// TestPrometheusRegistryIncludesRuntimeCollectors proves the Go runtime
+// and process collectors are wired up automatically by
+// NewPrometheusRegistry, with no explicit registration call beyond it.
+func TestPrometheusRegistryIncludesRuntimeCollectors(t *testing.T) {
+	reg := NewPrometheusRegistry()
+	server := httptest.NewServer(reg.Handler())
+	defer server.Close()
+
+	body := scrape(t, server.URL)
+	for _, want := range []string{"go_goroutines", "go_gc_duration_seconds", "process_cpu_seconds_total"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("Handler() output missing expected runtime collector metric %q:\n%s", want, body)
+		}
+	}
+}
+
+// TestPrometheusRegistryDuplicateNamePanics verifies the decided,
+// documented behavior for a name collision: registering the same metric
+// name twice panics, matching prometheus.MustRegister's own established
+// behavior, rather than silently returning a second, disconnected
+// instance.
+func TestPrometheusRegistryDuplicateNamePanics(t *testing.T) {
+	reg := NewPrometheusRegistry()
+	reg.NewCounter("duplicate_metric_total", "first registration")
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("NewCounter with a duplicate name did not panic, want a panic")
+		}
+	}()
+	reg.NewCounter("duplicate_metric_total", "second registration, should panic")
+}
+
+func scrape(t *testing.T, url string) string {
+	t.Helper()
+
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response body: %v", err)
+	}
+	return string(body)
+}

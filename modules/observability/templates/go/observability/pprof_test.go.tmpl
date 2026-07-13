@@ -1,0 +1,73 @@
+package observability
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+)
+
+func TestPprofMuxRegistersExpectedRoutes(t *testing.T) {
+	mux := PprofMux()
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{"index", "/debug/pprof/"},
+		{"cmdline", "/debug/pprof/cmdline"},
+		{"symbol", "/debug/pprof/symbol"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("%s: status = %d, want %d", tt.path, rec.Code, http.StatusOK)
+			}
+		})
+	}
+
+	// profile and trace both block for a duration (default 30s / 1s)
+	// unless the request's context is cancelled first — give each an
+	// already-expiring context so this stays a lightweight existence
+	// check, not a real multi-second profiling run.
+	for _, path := range []string{"/debug/pprof/profile", "/debug/pprof/trace"} {
+		t.Run(path, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+			defer cancel()
+
+			req := httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("%s: status = %d, want %d", path, rec.Code, http.StatusOK)
+			}
+			if rec.Body.Len() == 0 {
+				t.Fatalf("%s: response body is empty, want profile/trace bytes", path)
+			}
+		})
+	}
+}
+
+// TestPprofMuxDoesNotRegisterOnDefaultServeMux is the test that actually
+// proves the DefaultServeMux footgun was avoided, not just documented: it
+// hits http.DefaultServeMux directly and requires a 404, which would only
+// fail if this package (or anything else in the test binary) imported
+// net/http/pprof, since that package's init() registers onto
+// DefaultServeMux unconditionally as a side effect of the import alone.
+func TestPprofMuxDoesNotRegisterOnDefaultServeMux(t *testing.T) {
+	_ = PprofMux() // construct at least once, so this isn't vacuously true
+
+	req := httptest.NewRequest(http.MethodGet, "/debug/pprof/", nil)
+	rec := httptest.NewRecorder()
+	http.DefaultServeMux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("http.DefaultServeMux served /debug/pprof/ with status %d, want %d (pprof routes must not leak onto the default mux)", rec.Code, http.StatusNotFound)
+	}
+}

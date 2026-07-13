@@ -1,0 +1,169 @@
+// Package observability provides Go runtime profiling, Prometheus-backed
+// metrics, and build version/info endpoints.
+package observability
+
+import (
+	"bufio"
+	"bytes"
+	"fmt"
+	"net/http"
+	"os"
+	"runtime"
+	"runtime/pprof"
+	"runtime/trace"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// PprofMux returns a ServeMux with Go's runtime profiling endpoints
+// registered on it explicitly — NOT via the net/http/pprof package's
+// import-side-effect registration on http.DefaultServeMux, which is a
+// common footgun: a careless `import _ "net/http/pprof"` silently exposes
+// profiling endpoints (which leak memory addresses and stack traces, and
+// whose /debug/pprof/profile endpoint can be used for a cheap DoS via
+// expensive CPU profiling requests) on whatever server happens to be
+// listening on the default mux.
+//
+// Importing net/http/pprof at all — even only to reuse its exported
+// handler funcs — still runs that package's init() and registers onto
+// DefaultServeMux regardless of how it's imported; there is no way to use
+// that package without the side effect. So the handlers below are built
+// directly on runtime/pprof and runtime/trace instead, the same
+// primitives net/http/pprof itself is built on.
+//
+// Mount the returned mux on an INTERNAL-ONLY listener — a separate port
+// not exposed to the public internet, e.g. bound to localhost or an
+// internal network interface — never on the same mux as your public API
+// routes. This function deliberately does not wire itself into any
+// existing mux automatically, so that mistake requires an explicit,
+// visible choice rather than an accidental import.
+func PprofMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprofIndex)
+	mux.HandleFunc("/debug/pprof/cmdline", pprofCmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprofProfile)
+	mux.HandleFunc("/debug/pprof/symbol", pprofSymbol)
+	mux.HandleFunc("/debug/pprof/trace", pprofTrace)
+	return mux
+}
+
+// pprofCmdline responds with the running program's command line,
+// arguments separated by NUL bytes. Mirrors net/http/pprof.Cmdline.
+func pprofCmdline(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprint(w, strings.Join(os.Args, "\x00"))
+}
+
+// pprofProfile responds with a CPU profile in pprof's binary format,
+// captured for the duration given by the "seconds" query param (default
+// 30s, same as net/http/pprof.Profile). The capture stops early if the
+// request's context is cancelled — a client disconnect or server
+// shutdown ends profiling instead of leaving it running to completion.
+func pprofProfile(w http.ResponseWriter, r *http.Request) {
+	sec, err := strconv.ParseInt(r.FormValue("seconds"), 10, 64)
+	if err != nil || sec <= 0 {
+		sec = 30
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", `attachment; filename="profile"`)
+	if err := pprof.StartCPUProfile(w); err != nil {
+		http.Error(w, fmt.Sprintf("could not start CPU profile: %v", err), http.StatusInternalServerError)
+		return
+	}
+	select {
+	case <-time.After(time.Duration(sec) * time.Second):
+	case <-r.Context().Done():
+	}
+	pprof.StopCPUProfile()
+}
+
+// pprofTrace responds with an execution trace in binary form, captured
+// for the duration given by the "seconds" query param (default 1s, same
+// as net/http/pprof.Trace).
+func pprofTrace(w http.ResponseWriter, r *http.Request) {
+	sec, err := strconv.ParseFloat(r.FormValue("seconds"), 64)
+	if err != nil || sec <= 0 {
+		sec = 1
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", `attachment; filename="trace"`)
+	if err := trace.Start(w); err != nil {
+		http.Error(w, fmt.Sprintf("could not start trace: %v", err), http.StatusInternalServerError)
+		return
+	}
+	select {
+	case <-time.After(time.Duration(sec * float64(time.Second))):
+	case <-r.Context().Done():
+	}
+	trace.Stop()
+}
+
+// pprofSymbol maps program counters — given as a POST body or query
+// string, '+'-separated — to function names. Mirrors
+// net/http/pprof.Symbol.
+func pprofSymbol(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "num_symbols: 1\n")
+
+	var body *bufio.Reader
+	if r.Method == http.MethodPost {
+		body = bufio.NewReader(r.Body)
+	} else {
+		body = bufio.NewReader(strings.NewReader(r.URL.RawQuery))
+	}
+
+	for {
+		word, err := body.ReadSlice('+')
+		if err == nil {
+			word = word[:len(word)-1]
+		}
+		if pc, parseErr := strconv.ParseUint(strings.TrimSpace(string(word)), 0, 64); parseErr == nil && pc != 0 {
+			if fn := runtime.FuncForPC(uintptr(pc)); fn != nil {
+				fmt.Fprintf(&buf, "%#x %s\n", pc, fn.Name())
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+
+	w.Write(buf.Bytes())
+}
+
+// pprofIndex serves the named profile registered with runtime/pprof
+// (heap, goroutine, threadcreate, block, mutex, allocs) for a request
+// like "/debug/pprof/heap", or a plain-text listing of every available
+// profile for "/debug/pprof/" itself. Mirrors net/http/pprof.Index, minus
+// its HTML page and delta-profile support — cosmetic and advanced
+// features no consumer of this module needs; the underlying profile data
+// is unaffected.
+func pprofIndex(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimPrefix(r.URL.Path, "/debug/pprof/")
+	if name == "" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		for _, p := range pprof.Profiles() {
+			fmt.Fprintf(w, "%s\n", p.Name())
+		}
+		return
+	}
+
+	p := pprof.Lookup(name)
+	if p == nil {
+		http.Error(w, "unknown profile: "+name, http.StatusNotFound)
+		return
+	}
+
+	debug, _ := strconv.Atoi(r.FormValue("debug"))
+	if debug != 0 {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	} else {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, name))
+	}
+	_ = p.WriteTo(w, debug)
+}

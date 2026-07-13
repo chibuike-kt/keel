@@ -1,0 +1,44 @@
+package observability
+
+import (
+	"encoding/json"
+	"net/http"
+	"runtime"
+)
+
+// Version, Commit, and BuildTime are overridden at build time via
+// -ldflags, mirroring internal/buildinfo's existing pattern in the keel
+// CLI itself — applied here to the GENERATED project, not keel's own
+// binary. They keep these placeholder values for source builds that
+// don't pass -ldflags at all.
+var (
+	Version   = "dev"
+	Commit    = "unknown"
+	BuildTime = "unknown"
+)
+
+// infoBody is the JSON shape InfoHandler serves.
+type infoBody struct {
+	Version   string `json:"version"`
+	Commit    string `json:"commit"`
+	BuildTime string `json:"build_time"`
+	GoVersion string `json:"go_version"`
+}
+
+// InfoHandler serves build metadata as JSON: version, commit, and
+// build_time from the package-level vars above, and go_version from the
+// ACTUAL running Go toolchain via runtime.Version() — not a hardcoded or
+// ldflags-injected value. ldflags can only set values at link time,
+// baked into the binary; runtime.Version() reports what really compiled
+// it, which is the only value that can't drift out of sync with reality.
+func InfoHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(infoBody{
+			Version:   Version,
+			Commit:    Commit,
+			BuildTime: BuildTime,
+			GoVersion: runtime.Version(),
+		})
+	}
+}
