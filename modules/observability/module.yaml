@@ -21,3 +21,7 @@ languages:
         to: internal/observability/metrics.go
       - from: templates/go/observability/metrics_test.go.tmpl
         to: internal/observability/metrics_test.go
+      - from: templates/go/observability/version.go.tmpl
+        to: internal/observability/version.go
+      - from: templates/go/observability/version_test.go.tmpl
+        to: internal/observability/version_test.go
