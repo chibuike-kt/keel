@@ -1,0 +1,71 @@
+package observability
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"runtime"
+	"testing"
+)
+
+func TestInfoHandlerServesOverriddenBuildMetadata(t *testing.T) {
+	// Override the package-level vars the way -ldflags would at build
+	// time, then restore them — proves InfoHandler reads these vars
+	// live, not some value baked in at package-init time.
+	origVersion, origCommit, origBuildTime := Version, Commit, BuildTime
+	Version, Commit, BuildTime = "v1.2.3", "abc1234", "2026-07-13T00:00:00Z"
+	defer func() { Version, Commit, BuildTime = origVersion, origCommit, origBuildTime }()
+
+	body := requestInfo(t)
+
+	if body.Version != "v1.2.3" {
+		t.Errorf("version = %q, want %q", body.Version, "v1.2.3")
+	}
+	if body.Commit != "abc1234" {
+		t.Errorf("commit = %q, want %q", body.Commit, "abc1234")
+	}
+	if body.BuildTime != "2026-07-13T00:00:00Z" {
+		t.Errorf("build_time = %q, want %q", body.BuildTime, "2026-07-13T00:00:00Z")
+	}
+	// The load-bearing assertion: go_version must be the ACTUAL running
+	// toolchain's version, not a hardcoded/stale literal that could
+	// drift out of sync with whatever Go binary actually compiled this,
+	// and which -ldflags has no power to override above.
+	if body.GoVersion != runtime.Version() {
+		t.Errorf("go_version = %q, want %q (runtime.Version())", body.GoVersion, runtime.Version())
+	}
+}
+
+func TestInfoHandlerDefaults(t *testing.T) {
+	origVersion, origCommit, origBuildTime := Version, Commit, BuildTime
+	Version, Commit, BuildTime = "dev", "unknown", "unknown"
+	defer func() { Version, Commit, BuildTime = origVersion, origCommit, origBuildTime }()
+
+	body := requestInfo(t)
+
+	if body.Version != "dev" || body.Commit != "unknown" || body.BuildTime != "unknown" {
+		t.Fatalf("defaults = %+v, want version=dev commit=unknown build_time=unknown", body)
+	}
+}
+
+func requestInfo(t *testing.T) infoBody {
+	t.Helper()
+
+	handler := InfoHandler()
+	req := httptest.NewRequest(http.MethodGet, "/info", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want %q", got, "application/json")
+	}
+
+	var body infoBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body is not valid JSON: %v", err)
+	}
+	return body
+}
