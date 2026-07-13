@@ -104,9 +104,25 @@ func runInit(args []string, out, errOut io.Writer, stdin io.Reader, cat resolver
 	})
 
 	var selected []string
-	if modulesSet {
+	switch f, isFile := stdin.(*os.File); {
+	case modulesSet:
 		selected = splitModules(*modulesFlag)
-	} else {
+	case isFile && isInteractiveTerminal(f):
+		var confirmed bool
+		var err error
+		selected, confirmed, err = promptForModulesTUI(name, cat)
+		if err != nil {
+			fmt.Fprintf(errOut, "keel init: %v\n", err)
+			return 1
+		}
+		if !confirmed {
+			fmt.Fprintln(out, "keel init: cancelled")
+			return 0
+		}
+	default:
+		// stdin isn't a real terminal — piped input, CI, or a test's
+		// io.Reader that isn't even an *os.File. Falls back to the
+		// plain-text picker unchanged.
 		selected = promptForModules(out, stdin, cat)
 	}
 
