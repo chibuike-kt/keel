@@ -1,0 +1,16 @@
+apiVersion: keel/v1
+name: observability
+version: 0.1.0
+summary: "pprof profiling, Prometheus-backed metrics, and a version/info endpoint."
+tags: [reliability, observability]
+
+requires: []
+conflicts: []
+
+languages:
+  go:
+    templates:
+      - from: templates/go/observability/pprof.go.tmpl
+        to: internal/observability/pprof.go
+      - from: templates/go/observability/pprof_test.go.tmpl
+        to: internal/observability/pprof_test.go
