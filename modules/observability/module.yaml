@@ -9,8 +9,15 @@ conflicts: []
 
 languages:
   go:
+    dependencies:
+      - module: github.com/prometheus/client_golang
+        version: v1.23.2
     templates:
       - from: templates/go/observability/pprof.go.tmpl
         to: internal/observability/pprof.go
       - from: templates/go/observability/pprof_test.go.tmpl
         to: internal/observability/pprof_test.go
+      - from: templates/go/observability/metrics.go.tmpl
+        to: internal/observability/metrics.go
+      - from: templates/go/observability/metrics_test.go.tmpl
+        to: internal/observability/metrics_test.go

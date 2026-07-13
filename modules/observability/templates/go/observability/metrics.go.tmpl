@@ -1,0 +1,108 @@
+package observability
+
+import (
+	"net/http"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+// Counter is a monotonically increasing metric — request counts, error
+// counts, bytes processed.
+//
+// Small and unlabeled for v1: no label vectors yet. If a generated
+// project needs labeled metrics, extending this is a natural follow-up;
+// shipping label support before any real consumer needs it would be
+// exactly the kind of premature generalization avoided elsewhere in this
+// project (e.g. the migrations module decision).
+type Counter interface {
+	Inc()
+	Add(float64)
+}
+
+// Gauge is a metric that can go up or down — in-flight requests, queue
+// depth, connection pool size.
+type Gauge interface {
+	Set(float64)
+	Inc()
+	Dec()
+}
+
+// Histogram observes a distribution of values — request latency, payload
+// size — bucketed at creation time.
+type Histogram interface {
+	Observe(float64)
+}
+
+// Registry creates named metrics and exposes them over HTTP.
+//
+// This interface exists so a generated project's application code
+// depends on an abstraction, not directly on the Prometheus client
+// library — mirrors health.Checker's posture: this module SHIPS a
+// concrete Prometheus implementation (unlike health, which ships none),
+// but application code written against Registry could swap backends
+// later without a rewrite.
+type Registry interface {
+	NewCounter(name, help string) Counter
+	NewGauge(name, help string) Gauge
+	NewHistogram(name, help string, buckets []float64) Histogram
+	Handler() http.Handler // serves the /metrics endpoint
+}
+
+// PrometheusRegistry implements Registry using a private
+// prometheus.Registry — never the package-level default registerer.
+//
+// The default global registry is a well-known footgun in tests and
+// multi-instance scenarios: every package that imports prometheus and
+// calls a package-level registration function silently registers onto
+// the same global state, so two independent things in the same process
+// — or two instances in the same test binary — can collide on metric
+// names, or one test can observe metrics some unrelated test registered.
+type PrometheusRegistry struct {
+	reg *prometheus.Registry
+}
+
+// NewPrometheusRegistry returns a PrometheusRegistry backed by a fresh,
+// private prometheus.Registry, with the Go runtime and process collectors
+// (goroutines, GC pauses, memory, CPU) already registered — standard,
+// expected baseline metrics for any Prometheus-instrumented Go service,
+// available with zero extra code.
+func NewPrometheusRegistry() *PrometheusRegistry {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(collectors.NewGoCollector())
+	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	return &PrometheusRegistry{reg: reg}
+}
+
+// NewCounter registers and returns a new counter named name.
+//
+// Registering the same name twice panics — matching
+// prometheus.MustRegister's own established behavior — rather than
+// silently returning a second Counter instance that doesn't actually
+// back the same series.
+func (p *PrometheusRegistry) NewCounter(name, help string) Counter {
+	return promauto.With(p.reg).NewCounter(prometheus.CounterOpts{Name: name, Help: help})
+}
+
+// NewGauge registers and returns a new gauge named name. Registering the
+// same name twice panics, same as NewCounter.
+func (p *PrometheusRegistry) NewGauge(name, help string) Gauge {
+	return promauto.With(p.reg).NewGauge(prometheus.GaugeOpts{Name: name, Help: help})
+}
+
+// NewHistogram registers and returns a new histogram named name with the
+// given bucket boundaries. Registering the same name twice panics, same
+// as NewCounter.
+func (p *PrometheusRegistry) NewHistogram(name, help string, buckets []float64) Histogram {
+	return promauto.With(p.reg).NewHistogram(prometheus.HistogramOpts{Name: name, Help: help, Buckets: buckets})
+}
+
+// Handler serves the /metrics endpoint in Prometheus exposition format,
+// scoped only to metrics registered on this Registry — never anything
+// registered against the global prometheus.DefaultRegisterer elsewhere
+// in the process.
+func (p *PrometheusRegistry) Handler() http.Handler {
+	return promhttp.HandlerFor(p.reg, promhttp.HandlerOpts{})
+}
