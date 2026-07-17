@@ -278,6 +278,84 @@ func TestRunInitInteractivePromptEmptyMeansBaseOnly(t *testing.T) {
 	}
 }
 
+// TestRunInitHelpFlagPrintsUsageAndCreatesNothing is the regression test
+// for the bug found live during the 2026-07-16 audit: "keel init -h"
+// treated "-h" as the project name (it passes validateName) and
+// generated a real project directory named "-h". Both -h and --help
+// must instead print init's usage to stdout, exit 0, and — the actual
+// failure mode that happened — must never create a directory at all.
+func TestRunInitHelpFlagPrintsUsageAndCreatesNothing(t *testing.T) {
+	cat, templates := minimalCatalog()
+
+	for _, flag := range []string{"-h", "--help", "-help"} {
+		t.Run(flag, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+
+			var out, errOut bytes.Buffer
+			code := runInit([]string{flag}, &out, &errOut, strings.NewReader(""), cat, templates)
+
+			if code != 0 {
+				t.Fatalf("runInit() exit code = %d, want 0\nstderr:\n%s", code, errOut.String())
+			}
+			if !strings.Contains(out.String(), "keel init <name>") {
+				t.Fatalf("stdout = %q, want init's usage text", out.String())
+			}
+			if errOut.Len() != 0 {
+				t.Fatalf("stderr = %q, want empty on --help", errOut.String())
+			}
+
+			entries, err := os.ReadDir(".")
+			if err != nil {
+				t.Fatalf("ReadDir(.): %v", err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("directory entries created = %v, want none", entries)
+			}
+		})
+	}
+}
+
+// TestRunInitMissingNameErrorsClearly covers the two "no usable name"
+// shapes the audit flagged as unconfirmed: no arguments at all, and
+// flags given with no positional name (which, before the fix, would
+// have been misread as the project name itself instead of producing a
+// clear error).
+func TestRunInitMissingNameErrorsClearly(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"no_args", nil},
+		{"flags_only_no_name", []string{"--modules=idempotency,security"}},
+	}
+
+	cat, templates := minimalCatalog()
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+
+			var out, errOut bytes.Buffer
+			code := runInit(tt.args, &out, &errOut, strings.NewReader(""), cat, templates)
+
+			if code == 0 {
+				t.Fatalf("runInit() exit code = 0, want non-zero for args %v", tt.args)
+			}
+			if !strings.Contains(errOut.String(), "missing project name") {
+				t.Fatalf("stderr = %q, want it to mention a missing project name", errOut.String())
+			}
+
+			entries, err := os.ReadDir(".")
+			if err != nil {
+				t.Fatalf("ReadDir(.): %v", err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("directory entries created = %v, want none", entries)
+			}
+		})
+	}
+}
+
 func minimalCatalog() (resolver.MapCatalog, fs.FS) {
 	base := &manifest.Manifest{
 		Name: "base",
