@@ -1,0 +1,37 @@
+package auth
+
+import (
+	"context"
+	"testing"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+func TestWithClaimsFromContextRoundTrip(t *testing.T) {
+	want := Claims{
+		RegisteredClaims: jwt.RegisteredClaims{Subject: "user-123"},
+		Roles:            []string{"admin"},
+	}
+
+	ctx := WithClaims(context.Background(), want)
+	got, ok := FromContext(ctx)
+	if !ok {
+		t.Fatal("FromContext ok = false, want true")
+	}
+	if got.Subject != "user-123" || len(got.Roles) != 1 || got.Roles[0] != "admin" {
+		t.Fatalf("FromContext = %+v, want %+v", got, want)
+	}
+}
+
+// TestFromContextOnEmptyContextReturnsNotOK proves FromContext reports
+// absence explicitly (ok == false) rather than returning a zero-value
+// Claims that looks like a real, if empty, identity — the zero value
+// and "no identity present" must stay distinguishable, since Require
+// and RequireRole depend on that distinction to reject with 403 instead
+// of silently evaluating policy against a fake anonymous identity.
+func TestFromContextOnEmptyContextReturnsNotOK(t *testing.T) {
+	claims, ok := FromContext(context.Background())
+	if ok {
+		t.Fatalf("FromContext ok = true, want false for an empty context (got %+v)", claims)
+	}
+}

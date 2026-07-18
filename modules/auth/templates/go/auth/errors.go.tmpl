@@ -1,0 +1,37 @@
+package auth
+
+import "errors"
+
+var (
+	// ErrMissingToken is returned when the request has no bearer token
+	// to verify at all — no Authorization header, or one that isn't
+	// the "Bearer <token>" scheme.
+	ErrMissingToken = errors.New("auth: bearer token missing")
+
+	// ErrInvalidToken is returned for any token that fails verification
+	// for a reason other than expiry: a malformed token, a signature
+	// that doesn't match the signing key, or a token signed with
+	// anything other than HS256. Deliberately not distinguished further
+	// at the HTTP layer — the wire response must never tell a caller
+	// which specific thing was wrong with their token, since that's
+	// exactly the kind of detail that helps an attacker refine a forged
+	// one.
+	ErrInvalidToken = errors.New("auth: token invalid")
+
+	// ErrExpiredToken is returned specifically for a token that was
+	// validly signed but has passed its exp claim — kept distinct from
+	// ErrInvalidToken because a caller's own client code legitimately
+	// wants to tell "your session expired, log in again" apart from
+	// "this token is garbage or forged", even though both currently
+	// reject with the same 401 status.
+	ErrExpiredToken = errors.New("auth: token expired")
+
+	// ErrForbidden is returned by Require/RequireRole when either no
+	// Claims are present in the request context (Middleware never ran)
+	// or the caller's policy rejected the request's Claims. Both cases
+	// are indistinguishable from the caller's perspective — 403,
+	// nothing more specific. See Require's doc comment for why an
+	// absent Middleware is folded into this instead of treated as a
+	// server error.
+	ErrForbidden = errors.New("auth: forbidden")
+)

@@ -1,0 +1,31 @@
+package auth
+
+import "context"
+
+// contextKey is an unexported, unique type — the same safe
+// context-key pattern used throughout this codebase (see logging's
+// context.go), so a value stored under it can never collide with a key
+// some other package defines.
+type contextKey struct{}
+
+// WithClaims returns a copy of ctx carrying claims, retrievable later
+// with FromContext. Middleware calls this after successful
+// verification; it's exported so tests and other code that build a
+// request context directly (without going through Middleware) can do
+// the same.
+func WithClaims(ctx context.Context, claims Claims) context.Context {
+	return context.WithValue(ctx, contextKey{}, claims)
+}
+
+// FromContext returns the Claims stored in ctx by WithClaims, and
+// whether any were present at all. Unlike logging.FromContext, there is
+// no safe default identity to fall back to — a context with no Claims
+// means no verified caller, not "assume anonymous" — so the zero value
+// is returned alongside false rather than silently standing in as if
+// it meant something. Require and RequireRole treat a false ok exactly
+// like a failed policy check: reject with ErrForbidden, never panic on
+// the zero Claims.
+func FromContext(ctx context.Context) (Claims, bool) {
+	claims, ok := ctx.Value(contextKey{}).(Claims)
+	return claims, ok
+}

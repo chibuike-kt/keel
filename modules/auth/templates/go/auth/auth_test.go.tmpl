@@ -1,0 +1,95 @@
+package auth
+
+import (
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+func TestHS256IssueAndVerifyRoundTrip(t *testing.T) {
+	h := HS256{SigningKey: []byte("test-signing-key"), TTL: time.Hour}
+
+	tokenString, err := h.Issue("user-123", []string{"admin"})
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+
+	claims, err := h.Verify(tokenString)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if claims.Subject != "user-123" {
+		t.Fatalf("Subject = %q, want %q", claims.Subject, "user-123")
+	}
+	if len(claims.Roles) != 1 || claims.Roles[0] != "admin" {
+		t.Fatalf("Roles = %v, want [admin]", claims.Roles)
+	}
+}
+
+func TestHS256VerifyRejectsExpiredToken(t *testing.T) {
+	h := HS256{SigningKey: []byte("test-signing-key"), TTL: -time.Minute} // already expired at issue time
+
+	tokenString, err := h.Issue("user-123", nil)
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+
+	_, err = h.Verify(tokenString)
+	if !errors.Is(err, ErrExpiredToken) {
+		t.Fatalf("Verify() error = %v, want ErrExpiredToken", err)
+	}
+}
+
+// TestHS256VerifyRejectsWrongSigningKey is the actual security property
+// this package sells: a token signed with a different key must not
+// verify, even though it's otherwise a well-formed, unexpired HS256
+// token.
+func TestHS256VerifyRejectsWrongSigningKey(t *testing.T) {
+	issuer := HS256{SigningKey: []byte("issuer-key"), TTL: time.Hour}
+	verifier := HS256{SigningKey: []byte("different-key"), TTL: time.Hour}
+
+	tokenString, err := issuer.Issue("user-123", nil)
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+
+	_, err = verifier.Verify(tokenString)
+	if !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("Verify() error = %v, want ErrInvalidToken", err)
+	}
+}
+
+func TestHS256VerifyRejectsMalformedToken(t *testing.T) {
+	h := HS256{SigningKey: []byte("test-signing-key"), TTL: time.Hour}
+
+	_, err := h.Verify("not-a-real-token")
+	if !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("Verify() error = %v, want ErrInvalidToken", err)
+	}
+}
+
+// TestHS256VerifyRejectsDifferentSigningAlgorithm proves the
+// algorithm-confusion guard described in Verify's doc comment is real:
+// a token signed with HS512 (a valid HMAC algorithm, and the same key)
+// must still be rejected, because this package only ever accepts
+// exactly the algorithm it signs with.
+func TestHS256VerifyRejectsDifferentSigningAlgorithm(t *testing.T) {
+	key := []byte("test-signing-key")
+	claims := Claims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "user-123",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		},
+	}
+	tokenString, err := jwt.NewWithClaims(jwt.SigningMethodHS512, claims).SignedString(key)
+	if err != nil {
+		t.Fatalf("SignedString: %v", err)
+	}
+
+	h := HS256{SigningKey: key, TTL: time.Hour}
+	if _, err := h.Verify(tokenString); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("Verify() error = %v, want ErrInvalidToken (algorithm mismatch)", err)
+	}
+}
