@@ -88,6 +88,10 @@ func (r *Renderer) Render(plan *resolver.Plan, ctx Context, targetDir string) er
 		return err
 	}
 
+	if err := writeState(stagingDir, plan); err != nil {
+		return err
+	}
+
 	if err := os.Rename(stagingDir, targetDir); err != nil {
 		// The staging tree is fully rendered at this point; a failed rename
 		// is unexpected (e.g. targetDir's parent vanished, or a

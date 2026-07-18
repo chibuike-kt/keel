@@ -156,7 +156,7 @@ func runInit(args []string, out, errOut io.Writer, stdin io.Reader, cat resolver
 
 	plan, err := resolver.ResolveProject(cat, selected, *lang)
 	if err != nil {
-		printResolutionError(errOut, err)
+		printResolutionError(errOut, "keel init", err)
 		return 1
 	}
 
@@ -243,16 +243,17 @@ func promptForModules(out io.Writer, stdin io.Reader, cat resolver.MapCatalog) [
 
 // printResolutionError prints every problem resolver.ResolveProject
 // aggregated, not just the first, when it returns a *resolver.
-// ResolutionError.
-func printResolutionError(errOut io.Writer, err error) {
+// ResolutionError. cmd names the caller ("keel init", "keel add") so
+// the message accurately reflects which command actually failed.
+func printResolutionError(errOut io.Writer, cmd string, err error) {
 	if resErr, ok := errors.AsType[*resolver.ResolutionError](err); ok {
-		fmt.Fprintln(errOut, "keel init: could not resolve the requested modules:")
+		fmt.Fprintf(errOut, "%s: could not resolve the requested modules:\n", cmd)
 		for _, problem := range resErr.Unwrap() {
 			fmt.Fprintf(errOut, "  - %s\n", problem)
 		}
 		return
 	}
-	fmt.Fprintf(errOut, "keel init: %v\n", err)
+	fmt.Fprintf(errOut, "%s: %v\n", cmd, err)
 }
 
 // printRenderError prints every problem renderer.Render aggregated, not
