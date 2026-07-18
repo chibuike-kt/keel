@@ -10,6 +10,51 @@ import (
 // to touch it — no parents created, nothing written inside it.
 var ErrTargetExists = errors.New("target directory already exists")
 
+// ErrTargetMissing is returned by RenderAdd when targetDir does not
+// exist — the mirror image of ErrTargetExists: RenderAdd only ever
+// writes into an already-generated project, never creates one.
+var ErrTargetMissing = errors.New("target directory does not exist")
+
+// FileCollisionError reports a new module's template destination that
+// already exists on disk in the target project. This is the only
+// failure --force is allowed to bypass — a genuine conflict between
+// modules (DependencyConflictError, EnvVarConflictError) or in the
+// resolver's own requires/conflicts graph is never something a file
+// flag should override.
+type FileCollisionError struct {
+	Module string
+	Path   string
+}
+
+func (e *FileCollisionError) Error() string {
+	return fmt.Sprintf("module %q: %q already exists (use --force to overwrite)", e.Module, e.Path)
+}
+
+// AddError aggregates every file collision RenderAdd finds before
+// writing anything, the same aggregate-everything-first posture as
+// RenderError.
+type AddError struct {
+	FileCollisions []*FileCollisionError
+}
+
+func (e *AddError) Error() string {
+	errs := e.Unwrap()
+	parts := make([]string, len(errs))
+	for i, err := range errs {
+		parts[i] = err.Error()
+	}
+	return strings.Join(parts, "\n")
+}
+
+// Unwrap exposes the individual collisions for errors.As and errors.Is.
+func (e *AddError) Unwrap() []error {
+	errs := make([]error, len(e.FileCollisions))
+	for i, c := range e.FileCollisions {
+		errs[i] = c
+	}
+	return errs
+}
+
 // PathEscapeError reports a template destination that would write outside
 // the target directory. Computed independently of manifest validation —
 // Render never trusts that a Template.To was already checked.
