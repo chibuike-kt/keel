@@ -36,6 +36,10 @@ func Run(args []string, out, errOut io.Writer) int {
 		return 1
 	}
 
+	if len(args) > 0 && args[0] == "list" {
+		return cmdList(out, errOut)
+	}
+
 	fs := flag.NewFlagSet("keel", flag.ContinueOnError)
 	fs.SetOutput(errOut)
 

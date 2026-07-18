@@ -32,11 +32,7 @@ func isInteractiveTerminal(f *os.File) bool {
 // adds regardless), whether the user confirmed, and any error from
 // running the form itself (e.g. the user pressed Ctrl+C).
 func promptForModulesTUI(name string, cat resolver.MapCatalog) (selected []string, confirmed bool, err error) {
-	names := make([]string, 0, len(cat))
-	for n := range cat {
-		names = append(names, n)
-	}
-	sort.Strings(names)
+	names := sortedModuleNames(cat)
 
 	options := make([]huh.Option[string], len(names))
 	for i, n := range names {
