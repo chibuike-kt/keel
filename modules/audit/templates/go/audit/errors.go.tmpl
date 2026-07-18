@@ -1,0 +1,34 @@
+package audit
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+// ErrInvalidEvent is returned by Record when Event.Actor or
+// Event.Action is empty. See Event's doc comment for the exact
+// validation Record performs — Before and After are never validated.
+var ErrInvalidEvent = errors.New("audit: actor and action are required")
+
+// mapPgError translates a Postgres error into one prefixed
+// consistently with every other error this package returns, so a
+// caller never has to inspect a raw pgconn.PgError themselves. Record
+// only ever issues an INSERT, which the append-only trigger in
+// migrations/0001_audit_schema.sql has no reason to reject — that
+// trigger only fires on UPDATE or DELETE, which nothing in this
+// package's own code path ever issues — so there is no
+// audit-schema-specific error code to map here, unlike modules/ledger's
+// mapPgError. Errors this doesn't recognize are wrapped, not swallowed.
+func mapPgError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return fmt.Errorf("audit: %s", pgErr.Message)
+	}
+	return fmt.Errorf("audit: %w", err)
+}

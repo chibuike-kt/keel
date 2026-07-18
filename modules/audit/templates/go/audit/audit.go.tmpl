@@ -1,0 +1,53 @@
+// Package audit records an append-only, Postgres-backed trail of
+// business-level events — actor, action, and optional before/after
+// state — meant to survive independent of whatever retention policy an
+// application log stream happens to have. See
+// migrations/0001_audit_schema.sql for the schema, and the trigger that
+// makes "append-only" a database-enforced guarantee rather than a
+// convention this package's Go code merely follows.
+//
+// This package has no dependency on the auth module and doesn't import
+// it. If auth is also selected, pass claims.Subject (or another stable
+// identifier from auth.Claims) as Event.Actor — Actor is a plain string
+// regardless of what supplied it.
+//
+// Querying recorded events back is entirely the caller's own SQL; this
+// package is a write path only, by design.
+package audit
+
+import "github.com/jackc/pgx/v5/pgxpool"
+
+// Event is one business-level action to record. Actor and Action must
+// both be non-empty — Record rejects an Event failing that with
+// ErrInvalidEvent before it ever reaches Postgres. Before and After
+// have no validation: any value, including nil, is valid for both —
+// this package has no way to know what shape a caller's domain objects
+// take, and doesn't try to. A nil Before or After is stored as a real
+// SQL NULL, not the JSON literal "null"; see
+// migrations/0001_audit_schema.sql.
+type Event struct {
+	Actor  string
+	Action string
+	Before any
+	After  any
+}
+
+// validate reports the one thing that makes e unrecordable: an empty
+// Actor or Action.
+func (e Event) validate() error {
+	if e.Actor == "" || e.Action == "" {
+		return ErrInvalidEvent
+	}
+	return nil
+}
+
+// AuditTrail records events against a Postgres-backed audit_events
+// table. See migrations/0001_audit_schema.sql for the schema.
+type AuditTrail struct {
+	pool *pgxpool.Pool
+}
+
+// New returns an AuditTrail backed by pool.
+func New(pool *pgxpool.Pool) *AuditTrail {
+	return &AuditTrail{pool: pool}
+}

@@ -1,0 +1,53 @@
+package audit
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+)
+
+// Record validates e (see Event's doc comment), then inserts it into
+// audit_events, returning the row's generated ID. A nil Before or
+// After is stored as a real SQL NULL rather than the JSON literal
+// "null" — marshalOrNil never runs json.Marshal on a nil value, so
+// there's no marshaled bytes to send as a parameter at all in that
+// case, and pgx sends a Go nil []byte as SQL NULL regardless of the
+// target column's type.
+func (a *AuditTrail) Record(ctx context.Context, e Event) (int64, error) {
+	if err := e.validate(); err != nil {
+		return 0, err
+	}
+
+	before, err := marshalOrNil(e.Before)
+	if err != nil {
+		return 0, fmt.Errorf("audit: marshaling Before: %w", err)
+	}
+	after, err := marshalOrNil(e.After)
+	if err != nil {
+		return 0, fmt.Errorf("audit: marshaling After: %w", err)
+	}
+
+	const query = `
+		INSERT INTO audit_events (actor, action, before, after)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id
+	`
+
+	var id int64
+	if err := a.pool.QueryRow(ctx, query, e.Actor, e.Action, before, after).Scan(&id); err != nil {
+		return 0, mapPgError(err)
+	}
+	return id, nil
+}
+
+// marshalOrNil returns v marshaled to JSON, or (nil, nil) if v is a Go
+// nil — kept as a distinct step from json.Marshal itself because
+// json.Marshal(nil) would produce the three-byte slice "null", not a
+// nil slice, which is exactly the JSON-null-vs-SQL-NULL distinction
+// this package's schema is designed to preserve.
+func marshalOrNil(v any) ([]byte, error) {
+	if v == nil {
+		return nil, nil
+	}
+	return json.Marshal(v)
+}

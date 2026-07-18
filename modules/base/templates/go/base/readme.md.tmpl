@@ -27,3 +27,17 @@ it into your HTTP routes or call sites for you — for example, the
 any handler, and `webhook`'s provider verifiers are generated but not
 mounted on any endpoint. Wire them into your `cmd/api/main.go` (or
 wherever you build your router) as your application needs them.
+
+## Migrations
+
+Some modules (e.g. `ledger`, `audit`) generate their own SQL under
+`migrations/`. Each such file is numbered `0001` relative to that
+module's own migration history, not a project-wide sequence — selecting
+more than one of these modules means more than one file named
+`0001_*_schema.sql`. Most tools sort by full filename and handle that
+fine; a tool that treats the leading digits as a single, strictly
+unique version number across the whole directory (e.g. golang-migrate's
+default numeric scheme) will not. Check your migration tool's
+assumptions before running more than one module's migrations together.
+Keel does not run migrations itself — applying them, with whatever tool
+you choose, is up to you.
