@@ -180,11 +180,7 @@ func splitModules(s string) []string {
 // resolver.ResolveProject's own contract — the prompt says so explicitly
 // so that isn't a surprise later.
 func promptForModules(out io.Writer, stdin io.Reader, cat resolver.MapCatalog) []string {
-	names := make([]string, 0, len(cat))
-	for name := range cat {
-		names = append(names, name)
-	}
-	sort.Strings(names)
+	names := sortedModuleNames(cat)
 
 	fmt.Fprintln(out, "Available modules:")
 	for i, name := range names {
