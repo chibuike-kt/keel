@@ -28,6 +28,14 @@ Flags:
 
 var validNameRE = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
+// isHelpArg reports whether s is one of the conventional spellings of
+// the help flag, checked against args[0] before name validation so
+// "keel init -h" shows help instead of generating a project literally
+// named "-h".
+func isHelpArg(s string) bool {
+	return s == "-h" || s == "-help" || s == "--help"
+}
+
 // validateName rejects anything that isn't a safe, bare identifier
 // before name is used anywhere — as the target directory, substituted
 // into a Go string literal in main.go.tmpl (ProjectName), and as the
@@ -81,7 +89,17 @@ func runInit(args []string, out, errOut io.Writer, stdin io.Reader, cat resolver
 		flagSet.PrintDefaults()
 	}
 
-	if len(args) == 0 {
+	// args[0] must be checked for -h/--help and for looking like a flag
+	// before it's ever treated as the project name — otherwise "keel
+	// init -h" passes validateName (it's a legal bare identifier) and
+	// silently generates a real project directory named "-h".
+	if len(args) > 0 && isHelpArg(args[0]) {
+		flagSet.SetOutput(out)
+		fmt.Fprint(out, initUsage)
+		flagSet.PrintDefaults()
+		return 0
+	}
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 		fmt.Fprintln(errOut, "keel init: missing project name")
 		flagSet.Usage()
 		return 2
