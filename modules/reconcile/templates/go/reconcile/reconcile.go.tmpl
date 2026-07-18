@@ -1,0 +1,119 @@
+// Package reconcile compares an internal record set against an
+// external one by exact reference, classifying every reference into
+// exactly one of four categories: matched, mismatched, present only
+// internally, or present only externally.
+//
+// This package fetches nothing itself — the caller retrieves both
+// record sets however fits their situation (a provider's API, a CSV
+// export, a database query) and hands them to Compare as plain
+// slices. Matching is by exact Reference only; fuzzy matching (amount
+// + date + description heuristics, for systems that don't share a
+// stable reference between provider and internal records) is
+// explicitly out of scope for this version.
+//
+// This package also does not schedule or run itself on any cadence —
+// it is a function the caller invokes however and whenever they
+// choose (a cron job, an admin action, a one-off script). It holds no
+// timer and is not a job scheduler.
+package reconcile
+
+import "sort"
+
+// Record is one comparable item from either side of a reconciliation.
+// Reference is what Compare uses to pair records across sides; Data is
+// the record's full content — a provider's transaction, a ledger
+// entry, anything a caller's domain has — opaque to this package and
+// only ever handed to the caller's own equal func, never inspected
+// directly.
+type Record struct {
+	Reference string
+	Data      any
+}
+
+// Pair is one Reference found on both sides.
+type Pair struct {
+	Internal Record
+	External Record
+}
+
+// Report is the result of comparing an internal record set against an
+// external one. Every slice is sorted by Reference — Compare's own
+// internal bookkeeping uses maps, whose iteration order Go never
+// guarantees, so the result is sorted before being returned rather
+// than leaving callers (or tests) to depend on incidental map order.
+type Report struct {
+	// Matched holds every Reference present on both sides where equal
+	// reported the two records as agreeing.
+	Matched []Pair
+	// Mismatched holds every Reference present on both sides where
+	// equal reported the two records as disagreeing — same reference,
+	// different recorded facts (e.g. a charge exists on both sides but
+	// the amount differs).
+	Mismatched []Pair
+	// MissingInternal holds every Reference present in external with no
+	// corresponding internal record.
+	MissingInternal []Record
+	// MissingExternal holds every Reference present in internal with no
+	// corresponding external record.
+	MissingExternal []Record
+}
+
+// Compare finds every Reference present in internal, external, or
+// both, and classifies it into exactly one of Report's four
+// categories. A Reference present on both sides is compared via equal
+// — this package has no way to know what a caller's Data actually
+// contains, so it never compares Data itself, only hands both sides'
+// values to equal and trusts its verdict.
+//
+// If the same Reference appears more than once on the same side, the
+// last one encountered in that slice wins — earlier records sharing
+// that Reference are silently discarded from that side's view, not
+// merged and not treated as an error. This is deliberate, documented
+// behavior: a caller whose data can legitimately repeat a Reference on
+// one side needs to dedupe it themselves before calling Compare if
+// "last one wins" isn't the semantics they want.
+func Compare(internal, external []Record, equal func(internal, external any) bool) Report {
+	internalByRef := make(map[string]Record, len(internal))
+	for _, r := range internal {
+		internalByRef[r.Reference] = r // last one wins for a repeated Reference
+	}
+	externalByRef := make(map[string]Record, len(external))
+	for _, r := range external {
+		externalByRef[r.Reference] = r // last one wins for a repeated Reference
+	}
+
+	var report Report
+	for _, ref := range sortedRefs(internalByRef) {
+		in := internalByRef[ref]
+		ext, ok := externalByRef[ref]
+		if !ok {
+			report.MissingExternal = append(report.MissingExternal, in)
+			continue
+		}
+		pair := Pair{Internal: in, External: ext}
+		if equal(in.Data, ext.Data) {
+			report.Matched = append(report.Matched, pair)
+		} else {
+			report.Mismatched = append(report.Mismatched, pair)
+		}
+	}
+	for _, ref := range sortedRefs(externalByRef) {
+		if _, ok := internalByRef[ref]; !ok {
+			report.MissingInternal = append(report.MissingInternal, externalByRef[ref])
+		}
+	}
+
+	return report
+}
+
+// sortedRefs returns m's keys sorted, so Compare's map-driven traversal
+// produces a deterministic Report regardless of Go's randomized map
+// iteration order.
+func sortedRefs(m map[string]Record) []string {
+	refs := make([]string, 0, len(m))
+	for ref := range m {
+		refs = append(refs, ref)
+	}
+	sort.Strings(refs)
+	return refs
+}

@@ -1,0 +1,18 @@
+apiVersion: keel/v1
+name: reconcile
+version: 0.1.0
+summary: Exact-reference comparison between internal and external record sets, reporting matches, mismatches, and gaps.
+tags: [payments, correctness]
+
+requires: []
+conflicts: []
+
+env: []
+
+languages:
+  go:
+    templates:
+      - from: templates/go/reconcile/reconcile.go.tmpl
+        to: internal/reconcile/reconcile.go
+      - from: templates/go/reconcile/reconcile_test.go.tmpl
+        to: internal/reconcile/reconcile_test.go

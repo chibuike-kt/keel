@@ -31,7 +31,7 @@ func TestLoadCatalogRealEmbeddedModules(t *testing.T) {
 
 	want := []string{
 		"audit", "auth", "base", "config", "health", "idempotency", "ledger",
-		"logging", "observability", "ratelimit", "security", "webhook",
+		"logging", "observability", "ratelimit", "reconcile", "security", "webhook",
 	}
 	for _, name := range want {
 		if _, ok := cat.Module(name); !ok {

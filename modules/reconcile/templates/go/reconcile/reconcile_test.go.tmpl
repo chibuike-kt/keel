@@ -1,0 +1,222 @@
+package reconcile
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+// rec builds a Record inline. Used instead of an elided slice-of-struct
+// literal throughout this file: []Record holding an elided Record
+// value puts two opening braces directly adjacent in the source text,
+// which collides with Go template action delimiters — and every .tmpl
+// file in this catalog is parsed as a template at render time
+// regardless of whether it uses any template syntax itself. A helper
+// call sidesteps the collision entirely rather than depending on every
+// future edit to this file remembering to keep braces apart.
+func rec(ref string, data any) Record {
+	return Record{Reference: ref, Data: data}
+}
+
+func TestCompareBothSidesEqualIsMatched(t *testing.T) {
+	internal := []Record{rec("ref-1", 100)}
+	external := []Record{rec("ref-1", 100)}
+
+	report := Compare(internal, external, func(a, b any) bool { return a == b })
+
+	if len(report.Matched) != 1 {
+		t.Fatalf("Matched = %+v, want 1 entry", report.Matched)
+	}
+	if len(report.Mismatched) != 0 || len(report.MissingInternal) != 0 || len(report.MissingExternal) != 0 {
+		t.Fatalf("report = %+v, want only Matched populated", report)
+	}
+	if report.Matched[0].Internal.Reference != "ref-1" || report.Matched[0].External.Reference != "ref-1" {
+		t.Fatalf("Matched pair = %+v, want both sides referencing ref-1", report.Matched[0])
+	}
+}
+
+func TestCompareBothSidesNotEqualIsMismatched(t *testing.T) {
+	internal := []Record{rec("ref-1", 100)}
+	external := []Record{rec("ref-1", 200)}
+
+	report := Compare(internal, external, func(a, b any) bool { return a == b })
+
+	if len(report.Mismatched) != 1 {
+		t.Fatalf("Mismatched = %+v, want 1 entry", report.Mismatched)
+	}
+	if len(report.Matched) != 0 || len(report.MissingInternal) != 0 || len(report.MissingExternal) != 0 {
+		t.Fatalf("report = %+v, want only Mismatched populated", report)
+	}
+	if report.Mismatched[0].Internal.Data != 100 || report.Mismatched[0].External.Data != 200 {
+		t.Fatalf("Mismatched pair = %+v, want internal=100 external=200", report.Mismatched[0])
+	}
+}
+
+func TestCompareInternalOnlyIsMissingExternal(t *testing.T) {
+	internal := []Record{rec("ref-1", 100)}
+	var external []Record
+
+	report := Compare(internal, external, func(a, b any) bool { return a == b })
+
+	if len(report.MissingExternal) != 1 || report.MissingExternal[0].Reference != "ref-1" {
+		t.Fatalf("MissingExternal = %+v, want [ref-1]", report.MissingExternal)
+	}
+	if len(report.Matched) != 0 || len(report.Mismatched) != 0 || len(report.MissingInternal) != 0 {
+		t.Fatalf("report = %+v, want only MissingExternal populated", report)
+	}
+}
+
+func TestCompareExternalOnlyIsMissingInternal(t *testing.T) {
+	var internal []Record
+	external := []Record{rec("ref-1", 100)}
+
+	report := Compare(internal, external, func(a, b any) bool { return a == b })
+
+	if len(report.MissingInternal) != 1 || report.MissingInternal[0].Reference != "ref-1" {
+		t.Fatalf("MissingInternal = %+v, want [ref-1]", report.MissingInternal)
+	}
+	if len(report.Matched) != 0 || len(report.Mismatched) != 0 || len(report.MissingExternal) != 0 {
+		t.Fatalf("report = %+v, want only MissingInternal populated", report)
+	}
+}
+
+// TestCompareDuplicateReferenceSameSideLastOneWins proves the
+// documented "last one wins" behavior directly, rather than leaving it
+// to be inferred from the doc comment: two internal records share
+// ref-1, and only the second's Data must survive into the report.
+func TestCompareDuplicateReferenceSameSideLastOneWins(t *testing.T) {
+	internal := []Record{
+		rec("ref-1", "first"),
+		rec("ref-1", "second"),
+	}
+	external := []Record{rec("ref-1", "second")}
+
+	report := Compare(internal, external, func(a, b any) bool { return a == b })
+
+	if len(report.Matched) != 1 {
+		t.Fatalf("Matched = %+v, want exactly 1 entry (the surviving internal record matched against external)", report.Matched)
+	}
+	if report.Matched[0].Internal.Data != "second" {
+		t.Fatalf("Matched[0].Internal.Data = %v, want %q (the last of the two duplicate internal records)", report.Matched[0].Internal.Data, "second")
+	}
+}
+
+func TestCompareEmptySlicesNoPanic(t *testing.T) {
+	t.Run("both empty", func(t *testing.T) {
+		report := Compare(nil, nil, func(a, b any) bool { return a == b })
+		if len(report.Matched) != 0 || len(report.Mismatched) != 0 || len(report.MissingInternal) != 0 || len(report.MissingExternal) != 0 {
+			t.Fatalf("report = %+v, want an entirely empty Report", report)
+		}
+	})
+
+	t.Run("internal empty", func(t *testing.T) {
+		external := []Record{rec("ref-1", 1)}
+		report := Compare(nil, external, func(a, b any) bool { return a == b })
+		if len(report.MissingInternal) != 1 {
+			t.Fatalf("MissingInternal = %+v, want 1 entry", report.MissingInternal)
+		}
+	})
+
+	t.Run("external empty", func(t *testing.T) {
+		internal := []Record{rec("ref-1", 1)}
+		report := Compare(internal, nil, func(a, b any) bool { return a == b })
+		if len(report.MissingExternal) != 1 {
+			t.Fatalf("MissingExternal = %+v, want 1 entry", report.MissingExternal)
+		}
+	})
+}
+
+// TestCompareMultipleReferencesAllFourCategories exercises all four
+// categories in a single Compare call, so a bug that only shows up
+// when more than one reference is involved (e.g. a classification that
+// accidentally short-circuits after the first match) isn't masked by
+// tests that only ever set up one reference at a time.
+func TestCompareMultipleReferencesAllFourCategories(t *testing.T) {
+	internal := []Record{
+		rec("matched-ref", 100),
+		rec("mismatched-ref", 100),
+		rec("internal-only-ref", 100),
+	}
+	external := []Record{
+		rec("matched-ref", 100),
+		rec("mismatched-ref", 999),
+		rec("external-only-ref", 100),
+	}
+
+	report := Compare(internal, external, func(a, b any) bool { return a == b })
+
+	if len(report.Matched) != 1 || report.Matched[0].Internal.Reference != "matched-ref" {
+		t.Fatalf("Matched = %+v, want exactly [matched-ref]", report.Matched)
+	}
+	if len(report.Mismatched) != 1 || report.Mismatched[0].Internal.Reference != "mismatched-ref" {
+		t.Fatalf("Mismatched = %+v, want exactly [mismatched-ref]", report.Mismatched)
+	}
+	if len(report.MissingExternal) != 1 || report.MissingExternal[0].Reference != "internal-only-ref" {
+		t.Fatalf("MissingExternal = %+v, want exactly [internal-only-ref]", report.MissingExternal)
+	}
+	if len(report.MissingInternal) != 1 || report.MissingInternal[0].Reference != "external-only-ref" {
+		t.Fatalf("MissingInternal = %+v, want exactly [external-only-ref]", report.MissingInternal)
+	}
+}
+
+// providerCharge and payout stand in for the kind of nested,
+// struct-typed Data a real caller would put in a Record — proving the
+// JSON round-trip below actually exercises non-trivial shapes, not
+// just strings or ints.
+type providerCharge struct {
+	ID          string
+	AmountMinor int64
+	Metadata    map[string]string
+}
+
+type payout struct {
+	Reference   string
+	AmountMinor int64
+	Approved    bool
+}
+
+// TestReportMarshalsThroughJSONForAuditComposability proves a Report
+// containing genuinely nested, struct-typed Data round-trips through
+// encoding/json without error — the same marshaling audit.Record
+// performs internally on Before/After. This is the first real
+// cross-module data flow between two modules built this session:
+// a caller passing a Report as audit.Event.After only works if Report
+// (and whatever concrete types its Data fields hold) is actually
+// JSON-marshalable, which is worth proving directly rather than
+// assuming two independently-designed modules happen to compose.
+func TestReportMarshalsThroughJSONForAuditComposability(t *testing.T) {
+	report := Report{
+		Matched: []Pair{
+			{
+				Internal: Record{Reference: "ref-1", Data: payout{Reference: "ref-1", AmountMinor: 5000, Approved: true}},
+				External: Record{Reference: "ref-1", Data: providerCharge{ID: "ref-1", AmountMinor: 5000, Metadata: map[string]string{"provider": "stripe"}}},
+			},
+		},
+		Mismatched: []Pair{
+			{
+				Internal: Record{Reference: "ref-2", Data: payout{Reference: "ref-2", AmountMinor: 5000, Approved: true}},
+				External: Record{Reference: "ref-2", Data: providerCharge{ID: "ref-2", AmountMinor: 4800, Metadata: map[string]string{"provider": "paystack"}}},
+			},
+		},
+		MissingExternal: []Record{rec("ref-3", payout{Reference: "ref-3", AmountMinor: 1000})},
+		MissingInternal: []Record{rec("ref-4", providerCharge{ID: "ref-4", AmountMinor: 2000})},
+	}
+
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("json.Marshal(report): %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("json.Marshal(report) produced empty output")
+	}
+
+	// Round-trip into a generic shape and spot-check the nested struct
+	// data actually survived — not just that Marshal returned no error.
+	var decoded map[string]any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	mismatched, ok := decoded["Mismatched"].([]any)
+	if !ok || len(mismatched) != 1 {
+		t.Fatalf("decoded Mismatched = %v, want a single-element slice", decoded["Mismatched"])
+	}
+}
