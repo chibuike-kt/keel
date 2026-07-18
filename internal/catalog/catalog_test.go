@@ -30,7 +30,7 @@ func TestLoadCatalogRealEmbeddedModules(t *testing.T) {
 	}
 
 	want := []string{
-		"base", "config", "health", "idempotency", "ledger",
+		"auth", "base", "config", "health", "idempotency", "ledger",
 		"logging", "observability", "ratelimit", "security", "webhook",
 	}
 	for _, name := range want {

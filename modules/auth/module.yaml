@@ -1,0 +1,34 @@
+apiVersion: keel/v1
+name: auth
+version: 0.1.0
+summary: JWT bearer-token issuance/verification middleware and role-based authorization primitives.
+tags: [security]
+
+requires: []
+conflicts: []
+
+env:
+  - name: JWT_SIGNING_KEY
+    description: HMAC (HS256) signing key used to issue and verify access tokens.
+    required: true
+
+languages:
+  go:
+    dependencies:
+      - module: github.com/golang-jwt/jwt/v5
+        version: v5.3.1
+    templates:
+      - from: templates/go/auth/auth.go.tmpl
+        to: internal/auth/auth.go
+      - from: templates/go/auth/context.go.tmpl
+        to: internal/auth/context.go
+      - from: templates/go/auth/middleware.go.tmpl
+        to: internal/auth/middleware.go
+      - from: templates/go/auth/errors.go.tmpl
+        to: internal/auth/errors.go
+      - from: templates/go/auth/auth_test.go.tmpl
+        to: internal/auth/auth_test.go
+      - from: templates/go/auth/context_test.go.tmpl
+        to: internal/auth/context_test.go
+      - from: templates/go/auth/middleware_test.go.tmpl
+        to: internal/auth/middleware_test.go

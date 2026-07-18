@@ -1,0 +1,345 @@
+package auth
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+func testIssuer() HS256 {
+	return HS256{SigningKey: []byte("test-signing-key"), TTL: time.Hour}
+}
+
+func TestMiddlewareValidTokenSetsClaimsAndRunsNext(t *testing.T) {
+	h := testIssuer()
+	tokenString, err := h.Issue("user-123", []string{"admin"})
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+
+	var gotClaims Claims
+	var calledNext bool
+	handler := Middleware(h)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calledNext = true
+		gotClaims, _ = FromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenString)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if !calledNext {
+		t.Fatal("next was not called for a valid token")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if gotClaims.Subject != "user-123" {
+		t.Fatalf("Claims.Subject = %q, want %q", gotClaims.Subject, "user-123")
+	}
+}
+
+func TestMiddlewareMissingTokenRejects(t *testing.T) {
+	h := testIssuer()
+	called := false
+	handler := Middleware(h)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if called {
+		t.Fatal("next was called despite a missing Authorization header")
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestMiddlewareInvalidSignatureRejects(t *testing.T) {
+	issuer := HS256{SigningKey: []byte("issuer-key"), TTL: time.Hour}
+	verifier := HS256{SigningKey: []byte("different-key"), TTL: time.Hour}
+
+	tokenString, err := issuer.Issue("user-123", nil)
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+
+	called := false
+	handler := Middleware(verifier)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenString)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if called {
+		t.Fatal("next was called despite an invalid signature")
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+// TestMiddlewareExpiredTokenDistinctFromInvalidSignature proves expiry
+// and signature failure reject with the same HTTP status (401) but a
+// genuinely different underlying error — not two paths that happen to
+// look identical because only the status code was ever checked.
+func TestMiddlewareExpiredTokenDistinctFromInvalidSignature(t *testing.T) {
+	expired := HS256{SigningKey: []byte("test-signing-key"), TTL: -time.Minute}
+	expiredToken, err := expired.Issue("user-123", nil)
+	if err != nil {
+		t.Fatalf("Issue (expired): %v", err)
+	}
+
+	issuer := HS256{SigningKey: []byte("issuer-key"), TTL: time.Hour}
+	verifier := HS256{SigningKey: []byte("different-key"), TTL: time.Hour}
+	wrongKeyToken, err := issuer.Issue("user-123", nil)
+	if err != nil {
+		t.Fatalf("Issue (wrong key): %v", err)
+	}
+
+	doRequest := func(v Verifier, tokenString string) string {
+		t.Helper()
+		handler := Middleware(v)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("Authorization", "Bearer "+tokenString)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", rec.Code)
+		}
+		return rec.Body.String()
+	}
+
+	expiredBody := doRequest(expired, expiredToken)
+	wrongKeyBody := doRequest(verifier, wrongKeyToken)
+
+	if expiredBody == wrongKeyBody {
+		t.Fatalf("expired and wrong-signature responses are identical, want distinct error messages:\nexpired:    %s\nwrongKey: %s", expiredBody, wrongKeyBody)
+	}
+	if !strings.Contains(expiredBody, ErrExpiredToken.Error()) {
+		t.Fatalf("expired response = %s, want it to contain %q", expiredBody, ErrExpiredToken.Error())
+	}
+	if !strings.Contains(wrongKeyBody, ErrInvalidToken.Error()) {
+		t.Fatalf("wrong-key response = %s, want it to contain %q", wrongKeyBody, ErrInvalidToken.Error())
+	}
+}
+
+func withClaims(claims Claims, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r.WithContext(WithClaims(r.Context(), claims)))
+	})
+}
+
+func TestRequireRoleMatchingRoleRunsHandler(t *testing.T) {
+	called := false
+	handler := RequireRole("admin")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	handler = withClaims(Claims{Roles: []string{"admin", "support"}}, handler)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if !called {
+		t.Fatal("handler was not called despite a matching role")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+}
+
+func TestRequireRoleNonMatchingRoleRejects(t *testing.T) {
+	called := false
+	handler := RequireRole("admin")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+	handler = withClaims(Claims{Roles: []string{"support"}}, handler)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if called {
+		t.Fatal("handler was called despite no matching role")
+	}
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+}
+
+// TestRequireCustomPredicate proves the escape hatch in Require's
+// policy func actually works — an ownership check no fixed role string
+// could express — not just RequireRole's sugar over it. Covers both the
+// true and false paths so a Require that always returned true (or
+// always false) would still fail this test.
+func TestRequireCustomPredicate(t *testing.T) {
+	ownerPolicy := func(c Claims) bool { return c.Subject == "owner-1" }
+
+	newHandler := func() (http.Handler, *bool) {
+		called := new(bool)
+		return Require(ownerPolicy)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			*called = true
+			w.WriteHeader(http.StatusOK)
+		})), called
+	}
+
+	t.Run("owner", func(t *testing.T) {
+		handler, called := newHandler()
+		handler = withClaims(Claims{RegisteredClaims: jwt.RegisteredClaims{Subject: "owner-1"}}, handler)
+
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+		if !*called {
+			t.Fatal("handler was not called for the actual owner")
+		}
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+	})
+
+	t.Run("non_owner", func(t *testing.T) {
+		handler, called := newHandler()
+		handler = withClaims(Claims{RegisteredClaims: jwt.RegisteredClaims{Subject: "someone-else"}}, handler)
+
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+		if *called {
+			t.Fatal("handler was called for a non-owner")
+		}
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403", rec.Code)
+		}
+	})
+}
+
+// TestRequireWithoutPriorMiddlewareRejectsNotPanics is the explicit,
+// deliberate behavior documented on Require: calling it against a
+// request whose context never went through Middleware must reject with
+// 403, not panic and not 500. If this ever regressed to a panic, the
+// test runner would report it as a failure here rather than this
+// silently becoming undefined behavior in a generated project.
+func TestRequireWithoutPriorMiddlewareRejectsNotPanics(t *testing.T) {
+	called := false
+	handler := RequireRole("admin")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+
+	rec := httptest.NewRecorder()
+	// No withClaims wrapping at all -- this request's context never
+	// went through Middleware.
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if called {
+		t.Fatal("handler was called despite no Claims ever being placed in context")
+	}
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+}
+
+// TestRequireWithoutPriorMiddlewareRejectsEvenAnAlwaysTruePolicy is the
+// sharper version of the no-prior-Middleware guarantee: a policy that
+// would accept literally anything (including the zero-value Claims a
+// missing Middleware leaves behind) must still be rejected, because the
+// absence of Claims is checked explicitly before policy ever runs. A
+// weaker implementation that dropped the explicit ok check and only
+// relied on policy naturally rejecting a zero-value Claims would pass
+// TestRequireWithoutPriorMiddlewareRejectsNotPanics (RequireRole's empty
+// Roles slice already fails closed on its own) while still being
+// broken for any policy permissive enough to accept the zero value —
+// this test is what actually pins down that the ok check itself is
+// load-bearing, not just RequireRole's specific policy shape.
+func TestRequireWithoutPriorMiddlewareRejectsEvenAnAlwaysTruePolicy(t *testing.T) {
+	called := false
+	handler := Require(func(Claims) bool { return true })(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if called {
+		t.Fatal("handler was called despite no Claims ever being placed in context, even though the policy always returns true")
+	}
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+}
+
+// TestRealUsageAdminAndOwnershipRoutes exercises the two documented
+// usage patterns end to end — Middleware chained with RequireRole, and
+// Middleware chained with a custom Require predicate — against a real
+// mux, with valid, wrong-role, and missing tokens, the way a generated
+// project actually wires this package.
+func TestRealUsageAdminAndOwnershipRoutes(t *testing.T) {
+	issuer := testIssuer()
+
+	mux := http.NewServeMux()
+	mux.Handle("/admin/refunds", Middleware(issuer)(RequireRole("admin")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))))
+	mux.Handle("/invoices/", Middleware(issuer)(Require(func(c Claims) bool {
+		return c.Subject == "invoice-owner"
+	})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))))
+
+	adminToken, err := issuer.Issue("admin-1", []string{"admin"})
+	if err != nil {
+		t.Fatalf("Issue(admin): %v", err)
+	}
+	customerToken, err := issuer.Issue("customer-1", []string{"customer"})
+	if err != nil {
+		t.Fatalf("Issue(customer): %v", err)
+	}
+	ownerToken, err := issuer.Issue("invoice-owner", nil)
+	if err != nil {
+		t.Fatalf("Issue(owner): %v", err)
+	}
+
+	do := func(path, bearer string) int {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	cases := []struct {
+		name  string
+		path  string
+		token string
+		want  int
+	}{
+		{"admin route with admin token", "/admin/refunds", adminToken, http.StatusOK},
+		{"admin route with non-admin token", "/admin/refunds", customerToken, http.StatusForbidden},
+		{"admin route with no token", "/admin/refunds", "", http.StatusUnauthorized},
+		{"invoice route with owner token", "/invoices/1", ownerToken, http.StatusOK},
+		{"invoice route with non-owner token", "/invoices/1", customerToken, http.StatusForbidden},
+		{"invoice route with no token", "/invoices/1", "", http.StatusUnauthorized},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := do(tc.path, tc.token); got != tc.want {
+				t.Fatalf("status = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}

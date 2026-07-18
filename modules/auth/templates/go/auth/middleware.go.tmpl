@@ -1,0 +1,80 @@
+package auth
+
+import (
+	"encoding/json"
+	"net/http"
+	"strings"
+)
+
+// Middleware verifies the request's bearer token using verifier and, on
+// success, stores the resulting Claims in the request context via
+// WithClaims. A missing Authorization header, a header that isn't the
+// "Bearer <token>" scheme, an invalid signature, or an expired token are
+// all rejected with 401 before next ever runs.
+func Middleware(verifier Verifier) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			const prefix = "Bearer "
+
+			header := r.Header.Get("Authorization")
+			if !strings.HasPrefix(header, prefix) {
+				writeJSONError(w, http.StatusUnauthorized, ErrMissingToken.Error())
+				return
+			}
+
+			claims, err := verifier.Verify(strings.TrimPrefix(header, prefix))
+			if err != nil {
+				writeJSONError(w, http.StatusUnauthorized, err.Error())
+				return
+			}
+
+			next.ServeHTTP(w, r.WithContext(WithClaims(r.Context(), claims)))
+		})
+	}
+}
+
+// Require wraps a handler so it only runs if policy(claims) is true for
+// the Claims Middleware placed in context. Requests failing the check
+// are rejected with 403.
+//
+// If Middleware has not run before Require in the chain, Claims will be
+// absent and every request is rejected with 403 — this is deliberate,
+// not a footgun to work around. Require has no identity to evaluate
+// policy against without Middleware, and 403 is the honest status for
+// that: unlike panicking or returning 500, it doesn't treat a wiring
+// mistake as a server failure, and it doesn't reveal anything about
+// whether the resource would exist for a properly authenticated caller.
+func Require(policy func(Claims) bool) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			claims, ok := FromContext(r.Context())
+			if !ok || !policy(claims) {
+				writeJSONError(w, http.StatusForbidden, ErrForbidden.Error())
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// RequireRole is Require with the common case already written: policy
+// becomes "claims.Roles contains role". Anything a role string can't
+// express — ownership checks, multi-role combinations, anything
+// request-specific — is exactly what Require's policy func is for; see
+// its doc comment.
+func RequireRole(role string) func(http.Handler) http.Handler {
+	return Require(func(c Claims) bool {
+		for _, have := range c.Roles {
+			if have == role {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
+}

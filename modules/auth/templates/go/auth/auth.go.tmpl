@@ -1,0 +1,117 @@
+// Package auth issues and verifies HMAC-signed (HS256) JWT access
+// tokens and provides role/policy-based authorization primitives for
+// wrapping HTTP handlers.
+//
+// This package assumes a single service both issues and verifies its
+// own tokens, sharing one symmetric signing key between the two — HS256
+// is the correct choice for exactly that scope, where "issuer" and
+// "verifier" are the same service and there's no reason to keep the key
+// asymmetric. It is not designed for a different service verifying
+// tokens it did not issue: that's a multi-service deployment, and
+// moving to one means switching to an asymmetric algorithm (RS256 or
+// ES256 — a private key that only the issuer holds, and a public key
+// any number of services can use to verify, so the signing secret
+// itself never has to be shared with every verifier). That's a real
+// redesign of this package's key model, not a config flag this version
+// quietly grows into later.
+//
+// User registration, login, and password storage are explicitly out of
+// scope: this package assumes a caller has already established who a
+// user is by whatever means fits their product, and only takes over
+// from "mint a token for this identity" onward.
+//
+// If the logging module is also selected: its DefaultRedactedFields
+// list matches attribute keys exactly, not by substring, so "token"
+// being in that list does not catch a field literally named "jwt",
+// "bearer_token", or "session_id". Pass those names as additional
+// redactFields to logging.New if this package's tokens ever end up
+// logged under one of them.
+package auth
+
+import (
+	"errors"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+// Claims is the decoded, verified contents of an access token. Subject
+// and the standard registered claims (exp, iat, ...) are promoted from
+// the embedded jwt.RegisteredClaims; Roles is this package's one
+// addition — a plain, caller-defined list of strings. This package
+// ships no predefined roles of its own (no Admin/Support/Finance baked
+// in anywhere): what a role string means, and how many a project needs,
+// is entirely the generated project's decision.
+type Claims struct {
+	jwt.RegisteredClaims
+	Roles []string `json:"roles,omitempty"`
+}
+
+// Issuer mints a signed access token for subject (typically a user ID)
+// carrying roles.
+type Issuer interface {
+	Issue(subject string, roles []string) (string, error)
+}
+
+// Verifier checks whether a token string is a validly signed, unexpired
+// access token, returning its Claims.
+type Verifier interface {
+	Verify(tokenString string) (Claims, error)
+}
+
+// HS256 issues and verifies access tokens with a single shared HMAC
+// signing key — see the package doc comment for the single-service
+// assumption this depends on. HS256 satisfies both Issuer and Verifier.
+type HS256 struct {
+	// SigningKey is the shared secret used both to sign new tokens and
+	// verify existing ones.
+	SigningKey []byte
+	// TTL is how long an issued token remains valid. Issue sets exp to
+	// time.Now().Add(TTL).
+	TTL time.Duration
+}
+
+// Issue mints a new access token for subject carrying roles, signed
+// with h.SigningKey and expiring after h.TTL.
+func (h HS256) Issue(subject string, roles []string) (string, error) {
+	now := time.Now()
+	claims := Claims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   subject,
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(h.TTL)),
+		},
+		Roles: roles,
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(h.SigningKey)
+}
+
+// Verify parses and validates tokenString: signature, expiry, and
+// signing algorithm (HS256 only — see jwt.WithValidMethods below).
+// Restricting the accepted algorithm here is deliberate, not incidental:
+// without it, a token whose header simply claims a different algorithm
+// can bypass the intended verification entirely — the "algorithm
+// confusion" class of JWT vulnerability — so accepting only the exact
+// algorithm this package signs with is load-bearing, not defensive
+// boilerplate.
+//
+// A token that fails to parse or whose signature doesn't match returns
+// ErrInvalidToken; a token that parses and verifies but has passed its
+// exp claim returns ErrExpiredToken specifically, not ErrInvalidToken —
+// see ErrExpiredToken's doc comment for why that distinction matters
+// even though both currently map to the same HTTP status.
+func (h HS256) Verify(tokenString string) (Claims, error) {
+	var claims Claims
+	_, err := jwt.ParseWithClaims(tokenString, &claims, func(t *jwt.Token) (any, error) {
+		return h.SigningKey, nil
+	}, jwt.WithValidMethods([]string{"HS256"}))
+
+	if errors.Is(err, jwt.ErrTokenExpired) {
+		return Claims{}, ErrExpiredToken
+	}
+	if err != nil {
+		return Claims{}, ErrInvalidToken
+	}
+	return claims, nil
+}
