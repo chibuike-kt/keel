@@ -1,0 +1,87 @@
+package audit
+
+import (
+	"errors"
+	"testing"
+)
+
+func TestEventValidateAcceptsActorAndAction(t *testing.T) {
+	e := Event{Actor: "user-123", Action: "payout.approved"}
+	if err := e.validate(); err != nil {
+		t.Fatalf("validate() = %v, want nil", err)
+	}
+}
+
+// TestEventValidateAcceptsAnyBeforeAfter proves Before/After really are
+// unconstrained — including both nil — as long as Actor and Action are
+// present. A validate() that silently started rejecting some Before/
+// After shape would be a real, surprising regression against this
+// package's stated contract.
+func TestEventValidateAcceptsAnyBeforeAfter(t *testing.T) {
+	cases := []struct {
+		name         string
+		before, after any
+	}{
+		{"both nil", nil, nil},
+		{"before nil, after set", nil, map[string]any{"status": "approved"}},
+		{"both set", map[string]any{"status": "pending"}, map[string]any{"status": "approved"}},
+		{"scalar values", 42, "a plain string"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := Event{Actor: "user-123", Action: "payout.approved", Before: tc.before, After: tc.after}
+			if err := e.validate(); err != nil {
+				t.Fatalf("validate() = %v, want nil", err)
+			}
+		})
+	}
+}
+
+func TestEventValidateRejectsEmptyActor(t *testing.T) {
+	e := Event{Actor: "", Action: "payout.approved"}
+	if err := e.validate(); !errors.Is(err, ErrInvalidEvent) {
+		t.Fatalf("validate() = %v, want ErrInvalidEvent", err)
+	}
+}
+
+func TestEventValidateRejectsEmptyAction(t *testing.T) {
+	e := Event{Actor: "user-123", Action: ""}
+	if err := e.validate(); !errors.Is(err, ErrInvalidEvent) {
+		t.Fatalf("validate() = %v, want ErrInvalidEvent", err)
+	}
+}
+
+func TestEventValidateRejectsBothEmpty(t *testing.T) {
+	e := Event{}
+	if err := e.validate(); !errors.Is(err, ErrInvalidEvent) {
+		t.Fatalf("validate() = %v, want ErrInvalidEvent", err)
+	}
+}
+
+// TestMarshalOrNilPreservesGoNilAsNilBytes proves marshalOrNil's actual
+// job: a Go nil must come back as a nil byte slice, not the three-byte
+// JSON literal "null" that json.Marshal(nil) would produce — this is
+// the distinction Record depends on to store a real SQL NULL instead of
+// a stored JSON null. See postgres_test.go for the corresponding
+// real-Postgres check that this actually lands as SQL NULL in the
+// column, not just that the Go bytes look right in isolation.
+func TestMarshalOrNilPreservesGoNilAsNilBytes(t *testing.T) {
+	got, err := marshalOrNil(nil)
+	if err != nil {
+		t.Fatalf("marshalOrNil(nil): %v", err)
+	}
+	if got != nil {
+		t.Fatalf("marshalOrNil(nil) = %v, want a nil slice (not %q)", got, got)
+	}
+}
+
+func TestMarshalOrNilMarshalsNonNilValue(t *testing.T) {
+	got, err := marshalOrNil(map[string]any{"status": "approved"})
+	if err != nil {
+		t.Fatalf("marshalOrNil: %v", err)
+	}
+	want := `{"status":"approved"}`
+	if string(got) != want {
+		t.Fatalf("marshalOrNil = %q, want %q", got, want)
+	}
+}

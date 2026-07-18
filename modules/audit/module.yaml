@@ -1,0 +1,37 @@
+apiVersion: keel/v1
+name: audit
+version: 0.1.0
+summary: Postgres-backed, append-only audit trail for business-level events (actor, action, before/after state).
+tags: [payments, correctness]
+
+requires: []
+conflicts: []
+
+env:
+  - name: DATABASE_URL
+    description: Postgres connection string for the audit trail's append-only table.
+    required: true
+
+languages:
+  go:
+    dependencies:
+      # Pinned to the exact version modules/ledger/module.yaml declares.
+      # Two modules requiring the same Go module path at different
+      # versions is a hard resolver error (DependencyConflictError) the
+      # moment both are selected together, so this version must be
+      # bumped in lockstep with ledger's — never independently.
+      - module: github.com/jackc/pgx/v5
+        version: v5.10.0
+    templates:
+      - from: templates/go/audit/audit.go.tmpl
+        to: internal/audit/audit.go
+      - from: templates/go/audit/errors.go.tmpl
+        to: internal/audit/errors.go
+      - from: templates/go/audit/postgres.go.tmpl
+        to: internal/audit/postgres.go
+      - from: templates/go/audit/audit_test.go.tmpl
+        to: internal/audit/audit_test.go
+      - from: templates/go/audit/postgres_test.go.tmpl
+        to: internal/audit/postgres_test.go
+      - from: migrations/0001_audit_schema.sql
+        to: migrations/0001_audit_schema.sql

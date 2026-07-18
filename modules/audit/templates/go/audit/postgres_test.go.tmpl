@@ -1,0 +1,213 @@
+package audit
+
+import (
+	"context"
+	"errors"
+	"os"
+	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// These tests exercise AuditTrail against a real Postgres instance with
+// migrations/0001_audit_schema.sql applied. They're skipped unless
+// DATABASE_URL is set — CI does not currently run a Postgres service
+// container, so they're expected to skip there, not fail; wiring one up
+// is future work, out of scope for this module, the same posture
+// modules/ledger's own real-Postgres tests already take.
+func newTestAuditTrail(t *testing.T) (*AuditTrail, *pgxpool.Pool) {
+	t.Helper()
+
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		t.Skip("DATABASE_URL not set; skipping Postgres-backed audit test")
+	}
+
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatalf("ping: %v", err)
+	}
+
+	return New(pool), pool
+}
+
+// countByAction counts audit_events rows for action — actor/action
+// have no unique constraint (unlike ledger's external_ref/reference),
+// so each test uses its own distinctive action string to isolate its
+// assertions against a shared, persistent test database rather than
+// relying on the table being empty.
+func countByAction(t *testing.T, pool *pgxpool.Pool, action string) int {
+	t.Helper()
+	var count int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM audit_events WHERE action = $1`, action).Scan(&count); err != nil {
+		t.Fatalf("countByAction: %v", err)
+	}
+	return count
+}
+
+func TestRecordValidEventReturnsGeneratedID(t *testing.T) {
+	trail, _ := newTestAuditTrail(t)
+
+	id, err := trail.Record(context.Background(), Event{
+		Actor:  "user-123",
+		Action: "test.record_valid_event",
+		Before: map[string]any{"status": "pending"},
+		After:  map[string]any{"status": "approved"},
+	})
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if id <= 0 {
+		t.Fatalf("Record returned id = %d, want a real generated positive ID", id)
+	}
+}
+
+func TestRecordEmptyActorRejectedNothingWritten(t *testing.T) {
+	trail, pool := newTestAuditTrail(t)
+	const action = "test.empty_actor_rejected"
+
+	_, err := trail.Record(context.Background(), Event{Actor: "", Action: action})
+	if !errors.Is(err, ErrInvalidEvent) {
+		t.Fatalf("Record() error = %v, want ErrInvalidEvent", err)
+	}
+	if got := countByAction(t, pool, action); got != 0 {
+		t.Fatalf("countByAction(%q) = %d, want 0 (rejected event must not be written)", action, got)
+	}
+}
+
+func TestRecordEmptyActionRejectedNothingWritten(t *testing.T) {
+	trail, pool := newTestAuditTrail(t)
+	const actor = "test-actor-empty-action-rejected"
+
+	_, err := trail.Record(context.Background(), Event{Actor: actor, Action: ""})
+	if !errors.Is(err, ErrInvalidEvent) {
+		t.Fatalf("Record() error = %v, want ErrInvalidEvent", err)
+	}
+	// action is empty here, so isolate by actor instead — this is the
+	// one case where countByAction's own action-based filter can't be
+	// used, since the rejected event's action is the empty string being
+	// tested.
+	var count int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM audit_events WHERE actor = $1`, actor).Scan(&count); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("count = %d, want 0 (rejected event must not be written)", count)
+	}
+}
+
+// TestRecordNilBeforeAfterStoredAsRealSQLNull is the test the brief
+// specifically asked for: query the raw column back and confirm it is
+// SQL NULL, not the JSON literal "null" — checking Go-side round-
+// tripping alone would not catch a Record that accidentally stored the
+// three-byte string "null" instead of a real NULL, since scanning a
+// JSON "null" back into an any also yields a Go nil, masking the bug.
+func TestRecordNilBeforeAfterStoredAsRealSQLNull(t *testing.T) {
+	trail, pool := newTestAuditTrail(t)
+	const action = "test.nil_before_after_stored_as_null"
+
+	id, err := trail.Record(context.Background(), Event{
+		Actor:  "user-123",
+		Action: action,
+		Before: nil,
+		After:  nil,
+	})
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	var beforeIsNull, afterIsNull bool
+	const query = `SELECT before IS NULL, after IS NULL FROM audit_events WHERE id = $1`
+	if err := pool.QueryRow(context.Background(), query, id).Scan(&beforeIsNull, &afterIsNull); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if !beforeIsNull {
+		t.Fatal("before column is not SQL NULL — a nil Before must not be stored as the JSON literal \"null\"")
+	}
+	if !afterIsNull {
+		t.Fatal("after column is not SQL NULL — a nil After must not be stored as the JSON literal \"null\"")
+	}
+}
+
+// TestRecordNonNilBeforeAfterStoredAsJSONB is the companion to the nil
+// case above: a real value must land as real jsonb, not accidentally
+// also become NULL or a quoted string.
+func TestRecordNonNilBeforeAfterStoredAsJSONB(t *testing.T) {
+	trail, pool := newTestAuditTrail(t)
+	const action = "test.non_nil_before_after_stored_as_jsonb"
+
+	id, err := trail.Record(context.Background(), Event{
+		Actor:  "user-123",
+		Action: action,
+		Before: map[string]any{"status": "pending"},
+		After:  map[string]any{"status": "approved"},
+	})
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	var before, after string
+	const query = `SELECT before::text, after::text FROM audit_events WHERE id = $1`
+	if err := pool.QueryRow(context.Background(), query, id).Scan(&before, &after); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if before != `{"status": "pending"}` {
+		t.Fatalf("before = %q, want the stored jsonb value for {\"status\": \"pending\"}", before)
+	}
+	if after != `{"status": "approved"}` {
+		t.Fatalf("after = %q, want the stored jsonb value for {\"status\": \"approved\"}", after)
+	}
+}
+
+// TestPostgresRejectsDirectUpdate bypasses Record entirely and issues a
+// raw UPDATE against audit_events — proving the append-only guarantee
+// holds at the database level, not just for callers going through this
+// package's own Go API. Same posture as modules/ledger's
+// TestPostgresRejectsMutatingEntriesAndTransactions.
+func TestPostgresRejectsDirectUpdate(t *testing.T) {
+	trail, pool := newTestAuditTrail(t)
+
+	id, err := trail.Record(context.Background(), Event{Actor: "user-123", Action: "test.reject_direct_update"})
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	_, err = pool.Exec(context.Background(), `UPDATE audit_events SET action = 'tampered' WHERE id = $1`, id)
+	if err == nil {
+		t.Fatal("direct UPDATE against audit_events succeeded, want it rejected by the append-only trigger")
+	}
+	if !containsAppendOnlyCode(err) {
+		t.Fatalf("UPDATE error = %v, want the append-only trigger's AU001 SQLSTATE", err)
+	}
+}
+
+// TestPostgresRejectsDirectDelete is TestPostgresRejectsDirectUpdate's
+// counterpart for DELETE.
+func TestPostgresRejectsDirectDelete(t *testing.T) {
+	trail, pool := newTestAuditTrail(t)
+
+	id, err := trail.Record(context.Background(), Event{Actor: "user-123", Action: "test.reject_direct_delete"})
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	_, err = pool.Exec(context.Background(), `DELETE FROM audit_events WHERE id = $1`, id)
+	if err == nil {
+		t.Fatal("direct DELETE against audit_events succeeded, want it rejected by the append-only trigger")
+	}
+	if !containsAppendOnlyCode(err) {
+		t.Fatalf("DELETE error = %v, want the append-only trigger's AU001 SQLSTATE", err)
+	}
+}
+
+func containsAppendOnlyCode(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "AU001"
+}
