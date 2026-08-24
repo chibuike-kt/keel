@@ -1,0 +1,41 @@
+package txnstate
+
+import "testing"
+
+func TestGraphAllowsLegalTransition(t *testing.T) {
+	g := Graph{"created": {"authorized", "failed"}}
+	if !g.allows("created", "authorized") {
+		t.Fatal("allows(created, authorized) = false, want true")
+	}
+}
+
+func TestGraphRejectsIllegalTransition(t *testing.T) {
+	g := Graph{"created": {"authorized", "failed"}}
+	if g.allows("created", "settled") {
+		t.Fatal("allows(created, settled) = true, want false")
+	}
+}
+
+// TestGraphRejectsTransitionFromUnknownState proves a from-state with
+// no entry in g at all is treated as "nothing is legal from here", not
+// as a lookup error or a silent allow.
+func TestGraphRejectsTransitionFromUnknownState(t *testing.T) {
+	g := Graph{"created": {"authorized"}}
+	if g.allows("some-state-never-declared", "authorized") {
+		t.Fatal("allows(some-state-never-declared, authorized) = true, want false")
+	}
+}
+
+func TestGraphAllowsFirstTransitionFromNotYetExisting(t *testing.T) {
+	g := Graph{NotYetExisting: {"created"}}
+	if !g.allows(NotYetExisting, "created") {
+		t.Fatal("allows(NotYetExisting, created) = false, want true")
+	}
+}
+
+func TestGraphRejectsFirstTransitionNotListedUnderNotYetExisting(t *testing.T) {
+	g := Graph{NotYetExisting: {"created"}}
+	if g.allows(NotYetExisting, "settled") {
+		t.Fatal("allows(NotYetExisting, settled) = true, want false")
+	}
+}

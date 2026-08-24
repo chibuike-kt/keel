@@ -1,0 +1,37 @@
+apiVersion: keel/v1
+name: txnstate
+version: 0.1.0
+summary: Enforced state-machine transitions for business transaction lifecycles, durable and queryable by current state.
+tags: [payments, correctness]
+
+requires: []
+conflicts: []
+
+env:
+  - name: DATABASE_URL
+    description: Postgres connection string for the transaction state history table.
+    required: true
+
+languages:
+  go:
+    dependencies:
+      # Pinned to the exact version modules/ledger and modules/audit
+      # both declare. Two modules requiring the same Go module path at
+      # different versions is a hard resolver error the moment they're
+      # selected together, so this must be bumped in lockstep with
+      # both of those — never independently.
+      - module: github.com/jackc/pgx/v5
+        version: v5.10.0
+    templates:
+      - from: templates/go/txnstate/txnstate.go.tmpl
+        to: internal/txnstate/txnstate.go
+      - from: templates/go/txnstate/errors.go.tmpl
+        to: internal/txnstate/errors.go
+      - from: templates/go/txnstate/postgres.go.tmpl
+        to: internal/txnstate/postgres.go
+      - from: templates/go/txnstate/txnstate_test.go.tmpl
+        to: internal/txnstate/txnstate_test.go
+      - from: templates/go/txnstate/postgres_test.go.tmpl
+        to: internal/txnstate/postgres_test.go
+      - from: migrations/0001_txnstate_schema.sql
+        to: migrations/0001_txnstate_schema.sql

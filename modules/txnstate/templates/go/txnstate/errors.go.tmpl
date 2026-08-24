@@ -1,0 +1,38 @@
+package txnstate
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+// ErrIllegalTransition is returned by Transition when toState is not a
+// legal next state for the entity's actual current state, as read
+// under lock at the time of the call — never the state the caller
+// assumed it to be.
+var ErrIllegalTransition = errors.New("txnstate: illegal transition")
+
+// ErrNotFound is returned by CurrentState when entityID has never
+// transitioned at all.
+var ErrNotFound = errors.New("txnstate: entity has no recorded transitions")
+
+// mapPgError translates a Postgres error into one prefixed
+// consistently with every other error this package returns. Like
+// modules/audit's own mapPgError, Transition only ever issues an
+// INSERT, which the append-only trigger has no reason to reject —
+// that trigger only fires on UPDATE or DELETE, which nothing in this
+// package's own code path ever issues — so there is no
+// txnstate-schema-specific error code to map here. Errors this
+// doesn't recognize are wrapped, not swallowed.
+func mapPgError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return fmt.Errorf("txnstate: %s", pgErr.Message)
+	}
+	return fmt.Errorf("txnstate: %w", err)
+}

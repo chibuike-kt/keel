@@ -1,0 +1,358 @@
+package txnstate
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// These tests exercise Tracker against a real Postgres instance with
+// migrations/0001_txnstate_schema.sql applied. They're skipped unless
+// DATABASE_URL is set — same posture as modules/ledger's and
+// modules/audit's own real-Postgres tests.
+func newTestTracker(t *testing.T, graph Graph) (*Tracker, *pgxpool.Pool) {
+	t.Helper()
+
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		t.Skip("DATABASE_URL not set; skipping Postgres-backed txnstate test")
+	}
+
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatalf("ping: %v", err)
+	}
+
+	return New(pool, graph), pool
+}
+
+// uniqueEntityID returns an EntityID distinctive to this test — the
+// table has no unique constraint on entity_id (unlike ledger's
+// external_ref/reference), so each test isolates its own assertions
+// against a shared, persistent test database this way instead of
+// relying on the table being empty.
+func uniqueEntityID(t *testing.T) string {
+	t.Helper()
+	return fmt.Sprintf("%s-%d", t.Name(), time.Now().UnixNano())
+}
+
+func paymentGraph() Graph {
+	return Graph{
+		NotYetExisting: {"created"},
+		"created":      {"authorized", "failed"},
+		"authorized":   {"processing", "failed"},
+		"processing":   {"succeeded", "failed"},
+		"succeeded":    {"settled"},
+		"settled":      {"reversed"},
+	}
+}
+
+func TestTransitionLegalSucceedsFromDerivedCurrentState(t *testing.T) {
+	tracker, _ := newTestTracker(t, paymentGraph())
+	entityID := uniqueEntityID(t)
+
+	txn, err := tracker.Transition(context.Background(), entityID, "created", nil)
+	if err != nil {
+		t.Fatalf("Transition: %v", err)
+	}
+	if txn.FromState != NotYetExisting {
+		t.Fatalf("FromState = %q, want %q (derived, not caller-supplied)", txn.FromState, NotYetExisting)
+	}
+	if txn.ToState != "created" {
+		t.Fatalf("ToState = %q, want %q", txn.ToState, "created")
+	}
+
+	// A second, legal transition must derive its FromState from the
+	// first transition's actual result, not from anything the test
+	// itself asserts about it.
+	txn2, err := tracker.Transition(context.Background(), entityID, "authorized", nil)
+	if err != nil {
+		t.Fatalf("Transition (2nd): %v", err)
+	}
+	if txn2.FromState != "created" {
+		t.Fatalf("2nd FromState = %q, want %q (the actual current state, not assumed)", txn2.FromState, "created")
+	}
+}
+
+func TestTransitionIllegalRejectedNothingWritten(t *testing.T) {
+	tracker, _ := newTestTracker(t, paymentGraph())
+	entityID := uniqueEntityID(t)
+
+	if _, err := tracker.Transition(context.Background(), entityID, "created", nil); err != nil {
+		t.Fatalf("setup Transition: %v", err)
+	}
+
+	// "settled" is not legal from "created" — skips authorized,
+	// processing, succeeded entirely.
+	_, err := tracker.Transition(context.Background(), entityID, "settled", nil)
+	if !errors.Is(err, ErrIllegalTransition) {
+		t.Fatalf("Transition() error = %v, want ErrIllegalTransition", err)
+	}
+
+	history, err := tracker.History(context.Background(), entityID)
+	if err != nil {
+		t.Fatalf("History: %v", err)
+	}
+	if len(history) != 1 {
+		t.Fatalf("history = %d entries, want exactly 1 (the setup transition only — the rejected one must not be written)", len(history))
+	}
+}
+
+func TestTransitionFirstTransitionFromNotYetExisting(t *testing.T) {
+	t.Run("legal first state succeeds", func(t *testing.T) {
+		tracker, _ := newTestTracker(t, paymentGraph())
+		entityID := uniqueEntityID(t)
+
+		txn, err := tracker.Transition(context.Background(), entityID, "created", nil)
+		if err != nil {
+			t.Fatalf("Transition: %v", err)
+		}
+		if txn.FromState != NotYetExisting {
+			t.Fatalf("FromState = %q, want %q", txn.FromState, NotYetExisting)
+		}
+	})
+
+	t.Run("illegal first state rejected", func(t *testing.T) {
+		tracker, _ := newTestTracker(t, paymentGraph())
+		entityID := uniqueEntityID(t)
+
+		// "authorized" is not a legal first state — every entity must
+		// start at "created" under paymentGraph.
+		_, err := tracker.Transition(context.Background(), entityID, "authorized", nil)
+		if !errors.Is(err, ErrIllegalTransition) {
+			t.Fatalf("Transition() error = %v, want ErrIllegalTransition", err)
+		}
+
+		if _, err := tracker.CurrentState(context.Background(), entityID); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("CurrentState() error = %v, want ErrNotFound (rejected transition must not be written)", err)
+		}
+	})
+}
+
+func TestCurrentStateNoHistoryReturnsErrNotFound(t *testing.T) {
+	tracker, _ := newTestTracker(t, paymentGraph())
+	entityID := uniqueEntityID(t)
+
+	_, err := tracker.CurrentState(context.Background(), entityID)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("CurrentState() error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestHistoryReturnsFullOrderedHistory(t *testing.T) {
+	tracker, _ := newTestTracker(t, paymentGraph())
+	entityID := uniqueEntityID(t)
+
+	wantStates := []string{"created", "authorized", "processing", "succeeded"}
+	for _, state := range wantStates {
+		if _, err := tracker.Transition(context.Background(), entityID, state, nil); err != nil {
+			t.Fatalf("Transition(%s): %v", state, err)
+		}
+	}
+
+	history, err := tracker.History(context.Background(), entityID)
+	if err != nil {
+		t.Fatalf("History: %v", err)
+	}
+	if len(history) != len(wantStates) {
+		t.Fatalf("history = %d entries, want %d", len(history), len(wantStates))
+	}
+	for i, want := range wantStates {
+		if history[i].ToState != want {
+			t.Fatalf("history[%d].ToState = %q, want %q (oldest first)", i, history[i].ToState, want)
+		}
+	}
+
+	current, err := tracker.CurrentState(context.Background(), entityID)
+	if err != nil {
+		t.Fatalf("CurrentState: %v", err)
+	}
+	if current != "succeeded" {
+		t.Fatalf("CurrentState = %q, want %q", current, "succeeded")
+	}
+}
+
+// TestMetadataRoundTripsNilAndNonNil proves Metadata reuses audit's
+// exact nil-vs-JSON-null handling: a nil Metadata must land as a real
+// SQL NULL, and a real value must land as real jsonb — checked by
+// querying the raw column back, not just by trusting Go-side
+// round-tripping.
+func TestMetadataRoundTripsNilAndNonNil(t *testing.T) {
+	tracker, pool := newTestTracker(t, paymentGraph())
+
+	t.Run("nil metadata is SQL NULL", func(t *testing.T) {
+		entityID := uniqueEntityID(t)
+		txn, err := tracker.Transition(context.Background(), entityID, "created", nil)
+		if err != nil {
+			t.Fatalf("Transition: %v", err)
+		}
+
+		var isNull bool
+		const query = `SELECT metadata IS NULL FROM transaction_transitions WHERE entity_id = $1 AND to_state = $2`
+		if err := pool.QueryRow(context.Background(), query, txn.EntityID, txn.ToState).Scan(&isNull); err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		if !isNull {
+			t.Fatal("metadata column is not SQL NULL for a nil Metadata")
+		}
+	})
+
+	t.Run("non-nil metadata is real jsonb", func(t *testing.T) {
+		entityID := uniqueEntityID(t)
+		meta := map[string]any{"reversalOf": "txn-abc"}
+		if _, err := tracker.Transition(context.Background(), entityID, "created", meta); err != nil {
+			t.Fatalf("Transition: %v", err)
+		}
+
+		var stored string
+		const query = `SELECT metadata::text FROM transaction_transitions WHERE entity_id = $1 AND to_state = $2`
+		if err := pool.QueryRow(context.Background(), query, entityID, "created").Scan(&stored); err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		if stored != `{"reversalOf": "txn-abc"}` {
+			t.Fatalf("stored metadata = %q, want the jsonb value for {\"reversalOf\": \"txn-abc\"}", stored)
+		}
+
+		history, err := tracker.History(context.Background(), entityID)
+		if err != nil {
+			t.Fatalf("History: %v", err)
+		}
+		decoded, ok := history[0].Metadata.(map[string]any)
+		if !ok || decoded["reversalOf"] != "txn-abc" {
+			t.Fatalf("History()[0].Metadata = %#v, want a map with reversalOf=txn-abc", history[0].Metadata)
+		}
+	})
+}
+
+// TestTransitionConcurrentSameEntityOnlyOneSucceeds models
+// modules/ledger's own TestLedgerConcurrentTransfersDoNotDeadlock:
+// two goroutines race to transition the same entityID from the same
+// starting state ("created") to two different targets that are BOTH
+// individually legal from "created" ("authorized" and "cancelled").
+// Exactly one can actually apply — once either succeeds, the entity's
+// real current state is no longer "created", so the other transition,
+// evaluated against that actual (not assumed) current state, becomes
+// illegal. This is deliberately not a scenario where one target was
+// illegal from the start regardless of timing: that would pass even
+// with the advisory lock removed, proving nothing about whether
+// locking actually serializes concurrent access. This test only
+// passes if the lock genuinely prevents both goroutines from reading
+// "created" and proceeding to write at the same time.
+func TestTransitionConcurrentSameEntityOnlyOneSucceeds(t *testing.T) {
+	tracker, _ := newTestTracker(t, Graph{
+		NotYetExisting: {"created"},
+		"created":      {"authorized", "cancelled"},
+	})
+	entityID := uniqueEntityID(t)
+
+	if _, err := tracker.Transition(context.Background(), entityID, "created", nil); err != nil {
+		t.Fatalf("setup Transition: %v", err)
+	}
+
+	targets := []string{"authorized", "cancelled"}
+	results := make(chan error, len(targets))
+	var wg sync.WaitGroup
+	for _, target := range targets {
+		wg.Add(1)
+		go func(target string) {
+			defer wg.Done()
+			_, err := tracker.Transition(context.Background(), entityID, target, nil)
+			results <- err
+		}(target)
+	}
+	wg.Wait()
+	close(results)
+
+	var succeeded, illegal int
+	for err := range results {
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrIllegalTransition):
+			illegal++
+		default:
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("succeeded = %d, want exactly 1 (concurrent transitions to two different targets from the same state must not both apply)", succeeded)
+	}
+	if illegal != 1 {
+		t.Fatalf("illegal = %d, want exactly 1", illegal)
+	}
+
+	final, err := tracker.CurrentState(context.Background(), entityID)
+	if err != nil {
+		t.Fatalf("CurrentState: %v", err)
+	}
+	if final != "authorized" && final != "cancelled" {
+		t.Fatalf("final state = %q, want either authorized or cancelled (exactly one, not both, not neither)", final)
+	}
+
+	history, err := tracker.History(context.Background(), entityID)
+	if err != nil {
+		t.Fatalf("History: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("history = %d entries, want exactly 2 (created -> the one winning target); a double-write would show 3", len(history))
+	}
+}
+
+// TestPostgresRejectsDirectUpdate bypasses Transition entirely and
+// issues a raw UPDATE against transaction_transitions — proving the
+// append-only guarantee holds at the database level, not just for
+// callers going through this package's own Go API. Same posture as
+// modules/ledger's and modules/audit's own trigger tests.
+func TestPostgresRejectsDirectUpdate(t *testing.T) {
+	tracker, pool := newTestTracker(t, paymentGraph())
+	entityID := uniqueEntityID(t)
+
+	if _, err := tracker.Transition(context.Background(), entityID, "created", nil); err != nil {
+		t.Fatalf("Transition: %v", err)
+	}
+
+	_, err := pool.Exec(context.Background(), `UPDATE transaction_transitions SET to_state = 'tampered' WHERE entity_id = $1`, entityID)
+	if err == nil {
+		t.Fatal("direct UPDATE against transaction_transitions succeeded, want it rejected by the append-only trigger")
+	}
+	if !containsAppendOnlyCode(err) {
+		t.Fatalf("UPDATE error = %v, want the append-only trigger's TS001 SQLSTATE", err)
+	}
+}
+
+// TestPostgresRejectsDirectDelete is TestPostgresRejectsDirectUpdate's
+// counterpart for DELETE.
+func TestPostgresRejectsDirectDelete(t *testing.T) {
+	tracker, pool := newTestTracker(t, paymentGraph())
+	entityID := uniqueEntityID(t)
+
+	if _, err := tracker.Transition(context.Background(), entityID, "created", nil); err != nil {
+		t.Fatalf("Transition: %v", err)
+	}
+
+	_, err := pool.Exec(context.Background(), `DELETE FROM transaction_transitions WHERE entity_id = $1`, entityID)
+	if err == nil {
+		t.Fatal("direct DELETE against transaction_transitions succeeded, want it rejected by the append-only trigger")
+	}
+	if !containsAppendOnlyCode(err) {
+		t.Fatalf("DELETE error = %v, want the append-only trigger's TS001 SQLSTATE", err)
+	}
+}
+
+func containsAppendOnlyCode(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "TS001"
+}

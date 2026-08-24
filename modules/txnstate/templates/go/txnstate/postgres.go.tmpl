@@ -1,0 +1,194 @@
+package txnstate
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"hash/fnv"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// Transition moves entityID from its actual current state (read under
+// an advisory lock, never trusted from the caller) to toState,
+// recording the transition. It fails with ErrIllegalTransition if
+// toState is not legal from that current state under t.graph, and
+// writes nothing in that case.
+//
+// Locking: this table is append-only, so there is no single mutable
+// "current row" for entityID to SELECT ... FOR UPDATE the way
+// modules/ledger locks its accounts before checking or writing them.
+// Instead this uses a Postgres advisory lock (pg_advisory_xact_lock),
+// keyed by a hash of entityID, held for the
+// read-current-state-then-insert sequence inside one transaction, so
+// two concurrent Transition calls for the same entityID can't both
+// read the same "current" state and both proceed to write.
+//
+// pg_advisory_xact_lock is transaction-scoped: it releases
+// automatically at COMMIT or ROLLBACK, on whichever session took it.
+// Under pgxpool specifically — confirmed by reading
+// pgxpool.Pool.BeginTx directly, not assumed — Begin acquires one
+// dedicated connection from the pool and starts the transaction on
+// it, and every call made through the returned Tx (including this
+// function's lock acquisition, its current-state read, and its
+// insert) runs on that same connection until Commit or Rollback
+// releases it back to the pool. There is no risk of the lock landing
+// on one pooled connection and the subsequent read/write landing on
+// another, because this function never falls back to
+// t.pool.QueryRow/Exec directly for any of that sequence — everything
+// here goes through the one tx handle for its entire duration.
+func (t *Tracker) Transition(ctx context.Context, entityID, toState string, metadata any) (Transition, error) {
+	if entityID == "" {
+		return Transition{}, fmt.Errorf("txnstate: entityID must not be empty")
+	}
+
+	tx, err := t.pool.Begin(ctx)
+	if err != nil {
+		return Transition{}, fmt.Errorf("txnstate: begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx) // no-op once Commit succeeds
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, advisoryLockKey(entityID)); err != nil {
+		return Transition{}, fmt.Errorf("txnstate: acquiring advisory lock: %w", err)
+	}
+
+	fromState, err := currentStateTx(ctx, tx, entityID)
+	if err != nil {
+		return Transition{}, err
+	}
+
+	if !t.graph.allows(fromState, toState) {
+		return Transition{}, ErrIllegalTransition
+	}
+
+	metadataBytes, err := marshalOrNil(metadata)
+	if err != nil {
+		return Transition{}, fmt.Errorf("txnstate: marshaling Metadata: %w", err)
+	}
+
+	var txn Transition
+	const insert = `
+		INSERT INTO transaction_transitions (entity_id, from_state, to_state, metadata)
+		VALUES ($1, $2, $3, $4)
+		RETURNING entity_id, from_state, to_state, transitioned_at
+	`
+	if err := tx.QueryRow(ctx, insert, entityID, fromState, toState, metadataBytes).Scan(
+		&txn.EntityID, &txn.FromState, &txn.ToState, &txn.TransitionedAt,
+	); err != nil {
+		return Transition{}, mapPgError(err)
+	}
+	txn.Metadata = metadata
+
+	if err := tx.Commit(ctx); err != nil {
+		return Transition{}, mapPgError(err)
+	}
+	return txn, nil
+}
+
+// advisoryLockKey deterministically hashes entityID down to the int64
+// key pg_advisory_xact_lock takes. A collision — two different
+// entityIDs happening to hash to the same key — is not a correctness
+// problem: the worst case is two unrelated entities serializing
+// against each other unnecessarily for the duration of one
+// transaction, not incorrect state being read or written anywhere.
+// Nothing about Transition's design depends on this hash being
+// collision-free, only on the same entityID always producing the same
+// key, which any deterministic hash function guarantees regardless of
+// collisions with other inputs.
+func advisoryLockKey(entityID string) int64 {
+	h := fnv.New64a()
+	h.Write([]byte(entityID))
+	return int64(h.Sum64())
+}
+
+// currentStateTx reads entityID's latest to_state within tx — the same
+// connection Transition's caller already holds the advisory lock on,
+// so this reflects a state no concurrent Transition call for the same
+// entityID can have changed since the lock was acquired. Returns
+// NotYetExisting if entityID has no recorded transitions at all.
+func currentStateTx(ctx context.Context, tx pgx.Tx, entityID string) (string, error) {
+	const query = `
+		SELECT to_state FROM transaction_transitions
+		WHERE entity_id = $1
+		ORDER BY id DESC
+		LIMIT 1
+	`
+	var state string
+	err := tx.QueryRow(ctx, query, entityID).Scan(&state)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return NotYetExisting, nil
+	}
+	if err != nil {
+		return "", mapPgError(err)
+	}
+	return state, nil
+}
+
+// CurrentState returns entityID's latest recorded state, or ErrNotFound
+// if it has never transitioned at all.
+func (t *Tracker) CurrentState(ctx context.Context, entityID string) (string, error) {
+	const query = `
+		SELECT to_state FROM transaction_transitions
+		WHERE entity_id = $1
+		ORDER BY id DESC
+		LIMIT 1
+	`
+	var state string
+	err := t.pool.QueryRow(ctx, query, entityID).Scan(&state)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", mapPgError(err)
+	}
+	return state, nil
+}
+
+// History returns every transition recorded for entityID, oldest
+// first.
+func (t *Tracker) History(ctx context.Context, entityID string) ([]Transition, error) {
+	const query = `
+		SELECT entity_id, from_state, to_state, metadata, transitioned_at
+		FROM transaction_transitions
+		WHERE entity_id = $1
+		ORDER BY id ASC
+	`
+	rows, err := t.pool.Query(ctx, query, entityID)
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	defer rows.Close()
+
+	var history []Transition
+	for rows.Next() {
+		var txn Transition
+		var metadataBytes []byte
+		if err := rows.Scan(&txn.EntityID, &txn.FromState, &txn.ToState, &metadataBytes, &txn.TransitionedAt); err != nil {
+			return nil, mapPgError(err)
+		}
+		if metadataBytes != nil {
+			if err := json.Unmarshal(metadataBytes, &txn.Metadata); err != nil {
+				return nil, fmt.Errorf("txnstate: unmarshaling Metadata: %w", err)
+			}
+		}
+		history = append(history, txn)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapPgError(err)
+	}
+	return history, nil
+}
+
+// marshalOrNil returns v marshaled to JSON, or (nil, nil) if v is a Go
+// nil — same distinction modules/audit's own marshalOrNil makes,
+// reused here rather than reinvented: json.Marshal(nil) would produce
+// the three-byte slice "null", not a nil slice, which is exactly the
+// JSON-null-vs-SQL-NULL distinction this package's schema (like
+// audit's) is designed to preserve.
+func marshalOrNil(v any) ([]byte, error) {
+	if v == nil {
+		return nil, nil
+	}
+	return json.Marshal(v)
+}
