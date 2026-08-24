@@ -1,0 +1,85 @@
+// Package txnstate enforces a caller-defined state machine for
+// business transaction lifecycles — a payment, a payout, a KYC
+// review, anything with a "what state is this in" question that needs
+// to be durable and queryable, not just a label kept in application
+// memory.
+//
+// This package ships no predefined states or transitions (no Created/
+// Authorized/Settled enum): a fixed six-state lifecycle fits a card
+// payment reasonably well but not a payout (which typically has no
+// "Authorized" step) or a KYC review (which has neither "Authorized"
+// nor "Settled" at all). The caller supplies their own Graph.
+//
+// This package has no dependency on ledger or audit and doesn't import
+// either. A transition reaching whatever the caller's Graph considers
+// a terminal "succeeded" state is a natural moment to then call
+// ledger.Transfer/Post; every transition is a natural audit.Record
+// call (Action: "transaction.transitioned", Before: the from-state,
+// After: the to-state). Both are documented integration points here,
+// not dependencies.
+//
+// Reversal is not a special case: "reversed" is just another to-state
+// in the caller's own Graph. A caller wanting to record what a
+// reversal references passes that as Metadata — the same generic,
+// opaque-to-this-package mechanism every other transition already has,
+// not a bespoke field that only makes sense for one kind of edge.
+package txnstate
+
+import (
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// NotYetExisting is the reserved from-state of an EntityID that has
+// never transitioned. Any TEXT NOT NULL column permits an empty
+// string, so this is a Go-level convention this package enforces, not
+// a schema-level rule — Graph[NotYetExisting] lists whatever states
+// are legal as a first transition.
+const NotYetExisting = ""
+
+// Graph is a caller-defined transition graph: Graph[from] lists every
+// state a transition may legally move to when an entity's current
+// state is from. There is no default Graph — see the package doc
+// comment for why a fixed lifecycle doesn't fit every transaction type
+// this package might track.
+type Graph map[string][]string
+
+// allows reports whether to is a legal next state from from under g.
+// Pure function, no I/O — the database-level enforcement this package
+// also has (the append-only trigger in
+// migrations/0001_txnstate_schema.sql) is a different, fixed rule that
+// a static SQL trigger can express; legality of a specific
+// caller-defined transition can only be checked here, in Go, since a
+// trigger baked in at migration time has no way to see a runtime Go
+// map.
+func (g Graph) allows(from, to string) bool {
+	for _, candidate := range g[from] {
+		if candidate == to {
+			return true
+		}
+	}
+	return false
+}
+
+// Transition is one recorded state change for an EntityID.
+type Transition struct {
+	EntityID       string
+	FromState      string
+	ToState        string
+	Metadata       any
+	TransitionedAt time.Time
+}
+
+// Tracker enforces Graph and records every transition, append-only,
+// against a Postgres-backed table. See
+// migrations/0001_txnstate_schema.sql for the schema.
+type Tracker struct {
+	pool  *pgxpool.Pool
+	graph Graph
+}
+
+// New returns a Tracker backed by pool, enforcing graph.
+func New(pool *pgxpool.Pool, graph Graph) *Tracker {
+	return &Tracker{pool: pool, graph: graph}
+}
