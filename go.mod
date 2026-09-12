@@ -1,11 +1,11 @@
 module github.com/chibuike-kt/keel
 
-go 1.26
+go 1.26.0
 
 require (
 	charm.land/huh/v2 v2.0.3
 	github.com/goccy/go-yaml v1.19.2
-	golang.org/x/mod v0.38.0
+	golang.org/x/mod v0.41.0
 	golang.org/x/term v0.45.0
 )
 
